@@ -4,18 +4,6 @@ from torch import nn
 from ..ops.gemm import svdq_gemm_w4a4_cuda
 from ..ops.gemv import awq_gemv_w4a16_cuda
 from ..ops.quantize import svdq_quantize_w4a4_act_fuse_lora_cuda
-from ..ops.xpu_ops import is_available as _xpu_kernels_available, svdq_gemm_w4a4_xpu_bf16act
-
-_onednn_prepare = None
-def _get_onednn_prepare():
-    global _onednn_prepare
-    if _onednn_prepare is None:
-        try:
-            from omni_xpu_kernel.svdq import prepare_onednn_weights
-            _onednn_prepare = prepare_onednn_weights
-        except (ImportError, AttributeError):
-            _onednn_prepare = False
-    return _onednn_prepare
 
 
 class SVDQW4A4Linear(nn.Module):
@@ -117,51 +105,87 @@ class SVDQW4A4Linear(nn.Module):
         self, x: torch.Tensor, output: torch.Tensor | None = None
     ) -> torch.Tensor:
         batch_size, seq_len, channels = x.shape
-
         x = x.reshape(batch_size * seq_len, channels)
+
+        # XPU: always use direct W4A16 GEMM (skip activation quantization)
+        # This gives better precision than quantize→dequant→GEMM
+        if self.qweight.device.type == "xpu":
+            result = self._forward_xpu(x)
+            return result.reshape(batch_size, seq_len, -1)
+
         if output is None:
             output = torch.empty(
                 batch_size * seq_len, self.out_features, dtype=x.dtype, device=x.device
             )
-
-        # XPU optimization: skip activation INT4 quantize+dequant round-trip.
-        # Instead, compute LoRA down-proj and smooth_factor division on bf16
-        # activations directly, then pass to weight-only-dequant GEMM.
-        # This is MORE accurate (no quantization noise) and faster (~6s saved).
-        if x.device.type == "xpu" and _xpu_kernels_available():
-            if not hasattr(self, '_wgt_u4'):
-                prepare_fn = _get_onednn_prepare()
-                if prepare_fn:
-                    u4, sf16 = prepare_fn(self.qweight.view(torch.uint8), self.wscales)
-                    self._wgt_u4 = u4
-                    self._wscales_f16 = sf16
-                    self.qweight.data = torch.empty(0, dtype=torch.int8, device=x.device)
-                    self.wscales.data = torch.empty(0, dtype=self.wscales.dtype, device=x.device)
-                else:
-                    self._wgt_u4 = None
-                    self._wscales_f16 = None
-
-            lora_act_out = x @ self.proj_down
-            act_smoothed = x / self.smooth_factor
-            svdq_gemm_w4a4_xpu_bf16act(
-                act_bf16=act_smoothed,
-                wgt=self.qweight,
-                wscales=self.wscales,
-                out=output,
-                lora_act_in=lora_act_out,
-                lora_up=self.proj_up,
-                bias=self.bias,
-                alpha=self.wtscale,
-                wcscales=self.wcscales,
-                wgt_u4=self._wgt_u4,
-                wscales_f16=self._wscales_f16,
-            )
-        else:
-            quantized_x, ascales, lora_act_out = self.quantize(x)
-            output = self.forward_quant(quantized_x, ascales, lora_act_out, output)
-
+        quantized_x, ascales, lora_act_out = self.quantize(x)
+        output = self.forward_quant(quantized_x, ascales, lora_act_out, output)
         output = output.reshape(batch_size, seq_len, -1)
         return output
+
+    def _forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
+        """Direct W4A16 GEMM on XPU — no activation quantization.
+
+        Applies smooth factor, then uses oneDNN INT4 GEMM with bf16 activations.
+        Avoids the lossy quantize→dequantize round-trip.
+        Handles CPU input with XPU weights transparently.
+        """
+        try:
+            from omni_xpu_kernel import svdq as omni_svdq
+        except ImportError:
+            quantized_x, ascales, lora_act = self.quantize(x)
+            return self.forward_quant(quantized_x, ascales, lora_act)
+
+        input_device = x.device
+        x_orig_dtype = x.dtype
+        xpu_device = self.qweight.device
+
+        # Move input to XPU if needed
+        if x.device != xpu_device:
+            x = x.to(xpu_device)
+
+        # Apply smooth factor (rcp_smooth cached)
+        # fused_smooth_mul_convert outputs f16; keep as f16 to avoid extra bf16 conversion
+        if self.smooth_factor is not None:
+            if not hasattr(self, '_xpu_rcp_smooth') or self._xpu_rcp_smooth is None:
+                self._xpu_rcp_smooth = (1.0 / self.smooth_factor.float()).to(torch.float16)
+            x_gemm = omni_svdq.fused_smooth_mul_convert(x, self._xpu_rcp_smooth)
+            # x_gemm is f16 — oneDNN accepts both f16 and bf16
+        else:
+            x_gemm = x.to(torch.float16)
+
+        # Prepare oneDNN weights (cached)
+        if not hasattr(self, '_xpu_packed_u4') or self._xpu_packed_u4 is None:
+            wgt_u8 = self.qweight.view(torch.uint8)
+            self._xpu_packed_u4, self._xpu_scales_f16 = omni_svdq.prepare_onednn_weights(
+                wgt_u8, self.wscales
+            )
+
+        # W4A16 GEMM with fused LoRA+bias via onednn_int4_gemm_add_to_output
+        has_lora = self.proj_down is not None and self.proj_up is not None
+        if has_lora or self.bias is not None:
+            # Pre-fill dst with LoRA residual + bias
+            M = x_gemm.shape[0]
+            N = self.out_features
+            dst = torch.zeros(M, N, dtype=torch.bfloat16, device=x_gemm.device)
+            if has_lora:
+                lora_act = x.float() @ self.proj_down.float()
+                lora_out = lora_act @ self.proj_up.float().T
+                dst += lora_out.to(torch.bfloat16)
+            if self.bias is not None:
+                dst += self.bias.to(torch.bfloat16)
+            # Fused: dst += GEMM(f16_act, u4_wgt)
+            omni_svdq.onednn_int4_gemm_add_to_output(
+                x_gemm.to(torch.float16), self._xpu_packed_u4, self._xpu_scales_f16, dst
+            )
+            result = dst
+        else:
+            # No LoRA/bias: plain GEMM
+            result = omni_svdq.onednn_int4_gemm_preconverted(
+                x_gemm, self._xpu_packed_u4, self._xpu_scales_f16
+            )
+
+        # Convert to output dtype and move back to input device
+        return result.to(x_orig_dtype).to(input_device)
 
     def quantize(
         self, x: torch.Tensor, pad_size: int = 256
@@ -182,11 +206,15 @@ class SVDQW4A4Linear(nn.Module):
         lora_act: torch.Tensor,
         output: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        provided_output = output is not None
         if output is None:
+            output_dtype = self.proj_up.dtype
+            if quantized_x.device.type == "cpu":
+                output_dtype = torch.float32
             output = torch.empty(
                 quantized_x.shape[0],
                 self.out_features,
-                dtype=self.proj_up.dtype,
+                dtype=output_dtype,
                 device=quantized_x.device,
             )
 
@@ -204,6 +232,8 @@ class SVDQW4A4Linear(nn.Module):
             wcscales=self.wcscales,
             act_unsigned=self.act_unsigned,
         )
+        if quantized_x.device.type == "cpu" and not provided_output:
+            return output
         return output
 
     def __repr__(self):
@@ -264,6 +294,13 @@ class AWQW4A16Linear(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        input_device = x.device
+        weight_device = self.qweight.device
+
+        # Handle CPU input + XPU weights
+        if input_device != weight_device:
+            x = x.to(weight_device)
+
         output = awq_gemv_w4a16_cuda(
             in_feats=x,
             kernel=self.qweight,
@@ -277,6 +314,9 @@ class AWQW4A16Linear(nn.Module):
         if self.bias is not None:
             view_shape = [1] * (output.ndim - 1) + [-1]
             output.add_(self.bias.view(view_shape))
+
+        if output.device != input_device:
+            output = output.to(input_device)
         return output
 
     @classmethod

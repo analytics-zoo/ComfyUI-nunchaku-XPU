@@ -100,15 +100,14 @@ def get_precision(
     if isinstance(device, str):
         device = torch.device(device)
     if precision == "auto":
-        if device.type == "cuda":
+        if device.type != "cuda":
+            precision = "int4"
+        else:
             capability = torch.cuda.get_device_capability(
                 0 if device.index is None else device.index
             )
             sm = f"{capability[0]}{capability[1]}"
             precision = "fp4" if sm in ["120", "121"] else "int4"
-        else:
-            # CPU, XPU, and any other non-CUDA devices: always int4
-            precision = "int4"
     if pretrained_model_name_or_path is not None:
         if precision == "int4":
             if "fp4" in str(pretrained_model_name_or_path):

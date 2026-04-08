@@ -42,5 +42,5 @@ def default_dtype(device: torch.device) -> torch.dtype:
     if device.type == "cuda":
         return torch.bfloat16
     if device.type == "xpu":
-        return torch.bfloat16
+        return torch.float16
     return torch.float32

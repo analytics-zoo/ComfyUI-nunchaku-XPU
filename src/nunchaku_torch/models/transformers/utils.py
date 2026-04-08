@@ -97,6 +97,18 @@ _QWEIGHT_BYTE_INDEX_CACHE: dict[
 def _decode_packed_f16_m16n16_tiles_to_rowmajor(
     tensor_2d: torch.Tensor,
 ) -> torch.Tensor:
+    """Decode packed_fpsum_t MMA tile layout to row-major.
+
+    Matches the C++ ``unpack_fpsum`` function in ``gemm_base.cuh`` which
+    converts raw MMA register data through shared memory to produce
+    row-major output.
+
+    Per-lane mapping (lane 0-31, 8 half values per lane):
+        vals[0:2] → tile[lane//4,     (lane%4)*2 : (lane%4)*2+2]
+        vals[2:4] → tile[lane//4 + 8, (lane%4)*2 : (lane%4)*2+2]
+        vals[4:6] → tile[lane//4,     (lane%4)*2+8 : (lane%4)*2+10]
+        vals[6:8] → tile[lane//4 + 8, (lane%4)*2+8 : (lane%4)*2+10]
+    """
     rows, cols = tensor_2d.shape
     if rows % 16 != 0 or cols % 16 != 0:
         raise ValueError(f"tensor shape must be multiples of 16, got ({rows}, {cols})")
@@ -160,7 +172,35 @@ def decode_lora_updown_cuda_layout_kernel_consumed(
     return _decode_kernel_lora_tile_layout(tensor_2d)
 
 
+def _reorder_rows_int4_layout(tensor_2d: torch.Tensor) -> torch.Tensor:
+    """Reorder rows using the int4 GEMM tile N-dimension permutation.
+
+    The CUDA int4 GEMM kernel stores output features in a tile layout
+    (128-element blocks with ``_WSCALE_SRC_INDEX`` permutation).  LoRA
+    proj_up / proj_down must use the **same** row ordering as qweight,
+    wscales and bias so that the LoRA residual is added to the correct
+    output / input features on the CPU path.
+    """
+    rows, cols = tensor_2d.shape
+    if rows % 128 != 0:
+        raise ValueError(
+            f"tensor rows ({rows}) must be divisible by 128 for int4 layout reorder"
+        )
+    idx = _WSCALE_SRC_INDEX.to(tensor_2d.device)
+    out = torch.empty_like(tensor_2d)
+    for blk in range(rows // 128):
+        out[blk * 128 : (blk + 1) * 128] = tensor_2d[
+            blk * 128 : (blk + 1) * 128
+        ][idx]
+    return out
+
+
 def decode_lora_updown_cuda_layout_to_cpu(lora_wgt: torch.Tensor) -> torch.Tensor:
+    """Decode LoRA proj_up from CUDA packed lowrank layout to CPU row-major.
+
+    Uses ``NunchakuWeightPacker.unpack_lowrank_weight`` which matches the
+    ``pack_lowrank_weight`` used when the checkpoint was created.
+    """
     if lora_wgt.ndim != 2:
         raise ValueError(f"lora_wgt must be 2D, got ndim={lora_wgt.ndim}")
     if lora_wgt.dtype not in (torch.float16, torch.bfloat16):
@@ -169,13 +209,17 @@ def decode_lora_updown_cuda_layout_to_cpu(lora_wgt: torch.Tensor) -> torch.Tenso
 
 
 def decode_lora_down_cuda_layout_to_cpu(lora_wgt: torch.Tensor) -> torch.Tensor:
+    """Decode proj_down from CUDA packed lowrank layout to CPU row-major.
+
+    The packer stores proj_down transposed, so unpack gives ``(K, R)`` which
+    is then transposed to ``(R, K)``; our model parameter expects ``(K, R)``
+    via the checkpoint's physical shape, so ``.T.contiguous()`` restores it.
+    """
     if lora_wgt.ndim != 2:
         raise ValueError(f"lora_wgt must be 2D, got ndim={lora_wgt.ndim}")
     if lora_wgt.dtype not in (torch.float16, torch.bfloat16):
         raise ValueError(f"lora_wgt must be float16 or bfloat16, got {lora_wgt.dtype}")
-    return _LOWRANK_PACKER_FP16.unpack_lowrank_weight(
-        lora_wgt, down=True
-    ).T.contiguous()
+    return _LOWRANK_PACKER_FP16.unpack_lowrank_weight(lora_wgt, down=True).T.contiguous()
 
 
 def decode_lora_act_cuda_layout_to_cpu(lora_act: torch.Tensor) -> torch.Tensor:

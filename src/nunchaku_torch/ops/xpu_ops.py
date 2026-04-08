@@ -1,52 +1,34 @@
 """
-XPU-native ops for SVDQuant W4A4 inference using ESIMD kernels from omni_xpu_kernel.
+XPU ops backend for nunchaku_torch.
 
-These functions replace cpu_ops on XPU devices, using fused dequantize_w4
-(unpack INT4 + per-group scale in a single ESIMD kernel) instead of the
-separate unpack → groupwise-intdot path.
+Implements the 3 core nunchaku ops interfaces using omni_xpu_kernel's atomic kernels:
+1. svdq_quantize_w4a4_act_fuse_lora_xpu  (smooth + quantize_act + lora_down matmul)
+2. svdq_gemm_w4a4_xpu                    (onednn_int4_gemm + lora_up + bias + silu)
+3. awq_gemv_w4a16_xpu                    (dequant + matmul)
 
-GEMM strategy:
-    cpu_ops:  unpack_int4(act) * unpack_int4(wgt) → grouped intdot with scales
-    xpu_ops:  oneDNN INT4 fused dequant+GEMM (f16 activations, u4 weights)
-              Falls back to ESIMD dequant + bf16 matmul if oneDNN unavailable.
+All functions match the CPU reference signatures in cpu_ops.py for drop-in replacement.
 """
 
 import torch
+import torch.nn.functional as F
 
-try:
-    from omni_xpu_kernel import svdq as _svdq
-    _xpu_available = True
-    try:
-        _svdq.onednn_int4_gemm_preconverted
-        _onednn_available = True
-    except AttributeError:
-        _onednn_available = False
-    try:
-        _svdq.fused_convert_add
-        _fused_convert_add_available = True
-    except AttributeError:
-        _fused_convert_add_available = False
-    try:
-        _svdq.onednn_int4_gemm_add_to_output
-        _append_sum_available = True
-    except AttributeError:
-        _append_sum_available = False
-except ImportError:
-    _svdq = None
-    _xpu_available = False
-    _onednn_available = False
-    _fused_convert_add_available = False
-    _append_sum_available = False
+from ..utils import ceil_divide
+
+# Lazy import omni_xpu_kernel to avoid import errors on non-XPU systems
+_omni = None
 
 
-def is_available() -> bool:
-    """Check whether XPU ESIMD kernels are available."""
-    return _xpu_available
+def _get_omni():
+    global _omni
+    if _omni is None:
+        import omni_xpu_kernel
+        _omni = omni_xpu_kernel
+    return _omni
 
 
-# ---------------------------------------------------------------------------
-# Activation quantization
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Op 1: svdq_quantize_w4a4_act_fuse_lora_xpu
+# ============================================================================
 
 def svdq_quantize_w4a4_act_fuse_lora_xpu(
     input: torch.Tensor,
@@ -58,48 +40,83 @@ def svdq_quantize_w4a4_act_fuse_lora_xpu(
     fuse_glu: bool = False,
     fp4: bool = False,
 ) -> None:
-    """XPU-native activation quantization using ESIMD quantize_act_int4 kernel."""
-    if fp4:
-        raise NotImplementedError(
-            "XPU kernels do not support NVFP4 (fp4) quantization"
-        )
-    if fuse_glu:
-        raise NotImplementedError(
-            "XPU kernels do not support fused GLU (Gated Linear Unit)"
-        )
+    """XPU implementation of activation quantization with LoRA fusion.
 
+    Composes omni_xpu_kernel primitives:
+      1. fused_smooth_mul_convert (smooth + bf16->f16 conversion)
+      2. quantize_act_int4 (per-group INT4 quantization)
+      3. torch.matmul (LoRA down projection)
+    """
+    if fp4:
+        raise NotImplementedError("XPU backend does not support NVFP4 (fp4)")
+    if fuse_glu:
+        raise NotImplementedError("XPU backend does not support fused GLU")
+
+    omni = _get_omni()
     M, K = input.shape
     M_pad = output.shape[0]
 
-    x = input.float()
+    # Resolve device: use XPU if smooth is on XPU, else CPU
+    compute_device = smooth.device if smooth is not None else input.device
+    if compute_device.type != "xpu" and lora_down is not None:
+        compute_device = lora_down.device
 
-    # LoRA down-projection (still in PyTorch — no ESIMD kernel for this)
+    # Move input to compute device if needed
+    inp = input.to(compute_device) if input.device != compute_device else input
+
+    # Step 1: LoRA down projection (on original input, before smoothing)
     if lora_down is not None and lora_act_out is not None:
-        lora_result = x @ lora_down.float()
-        lora_act_out[:M].copy_(lora_result)
+        lora_result = inp.float() @ lora_down.to(compute_device).float()
+        lora_act_out[:M].copy_(lora_result.to(lora_act_out.dtype).to(lora_act_out.device))
         if M_pad > M:
             lora_act_out[M:].zero_()
 
-    # Apply smooth factor before quantization
+    # Step 2: Apply smoothing and convert to bf16
     if smooth is not None:
-        x = x / smooth.float()
+        smooth_dev = smooth.to(compute_device)
+        rcp_smooth = (1.0 / smooth_dev.float()).to(torch.float16)
+        x_smooth = omni.svdq.fused_smooth_mul_convert(inp, rcp_smooth)
+        x_smooth = x_smooth.to(torch.bfloat16)
+    else:
+        x_smooth = inp.to(torch.bfloat16)
 
-    # ESIMD quantize_act_int4: input [M, K] → (packed [M, K/2], scales [G, M])
-    packed, scales = _svdq.quantize_act_int4(x, group_size=64)
-
-    output[:M].copy_(packed)
+    # Step 3: Pad to M_pad
     if M_pad > M:
-        output[M:].zero_()
+        x_padded = torch.zeros(M_pad, K, dtype=x_smooth.dtype, device=compute_device)
+        x_padded[:M] = x_smooth
+    else:
+        x_padded = x_smooth.contiguous()
 
-    # scales from ESIMD kernel are [G, M], oscales expects [G, M_pad] with dtype match
-    oscales[:, :M].copy_(scales.to(oscales.dtype))
-    if M_pad > M:
-        oscales[:, M:].zero_()
+    # Step 4: Quantize activation to INT4
+    packed_act, ascales = omni.svdq.quantize_act_int4(x_padded, group_size=64)
+
+    # Step 5: Copy to output buffers (handle device mismatch)
+    packed_out = packed_act.to(output.device)
+    if output.dtype != packed_out.dtype:
+        output.copy_(packed_out.view(output.dtype))
+    else:
+        output.copy_(packed_out)
+    oscales.copy_(ascales.to(oscales.dtype).to(oscales.device))
 
 
-# ---------------------------------------------------------------------------
-# GEMM  (W4A4)
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Op 2: svdq_gemm_w4a4_xpu
+# ============================================================================
+
+# Cache for pre-converted oneDNN weights: {data_ptr: (packed_u4, scales_f16)}
+_weight_cache = {}
+
+
+def _get_prepared_weights(wgt: torch.Tensor, wscales: torch.Tensor):
+    """Get or create pre-converted oneDNN weights (cached by data_ptr)."""
+    key = wgt.data_ptr()
+    if key not in _weight_cache:
+        omni = _get_omni()
+        wgt_u8 = wgt.view(torch.uint8)
+        packed_u4, scales_f16 = omni.svdq.prepare_onednn_weights(wgt_u8, wscales)
+        _weight_cache[key] = (packed_u4, scales_f16)
+    return _weight_cache[key]
+
 
 def svdq_gemm_w4a4_xpu(
     act: torch.Tensor,
@@ -135,270 +152,177 @@ def svdq_gemm_w4a4_xpu(
     lora_up_effective: torch.Tensor | None = None,
     bias_effective: torch.Tensor | None = None,
 ) -> None:
-    """
-    XPU-native GEMM using ESIMD dequantize_w4 + bf16 matmul.
+    """XPU implementation of quantized GEMM with LoRA fusion.
 
-    Strategy:
-        1. Dequantize weights:  ESIMD dequantize_w4([N, K/2], [G, N]) → [N, K] bf16
-        2. Dequantize activations: ESIMD dequantize_w4([M, K/2], [G, M]) → [M, K] bf16
-        3. Matmul: act_deq @ wgt_deq.T → [M, N] result
-        4. Apply alpha, wcscales, LoRA, bias, SiLU as needed
-        5. Optionally re-quantize output for next layer (fused GEMM chain)
+    Composes omni_xpu_kernel primitives:
+      1. dequantize_w4 (unpack INT4 activations back to f16)
+      2. onednn_int4_gemm_preconverted (W4 GEMM via oneDNN)
+      3. torch.matmul (LoRA residual: lora_act @ lora_up.T)
+      4. torch.add (bias)
+      5. F.silu (optional fuse_silu for SwiGLU)
+
+    For qout path (fused_gelu_mlp): also handles GELU + next-layer quantization.
     """
     if fp4:
-        raise NotImplementedError(
-            "XPU kernels do not support NVFP4 (fp4) quantization"
-        )
+        raise NotImplementedError("XPU backend does not support NVFP4 (fp4)")
     if ascales is None or wscales is None:
         raise ValueError("ascales and wscales are required")
 
-    # --- Step 1: Dequantize weights via ESIMD kernel (fused unpack + scale) ---
-    wgt_deq = _svdq.dequantize_w4(wgt.view(torch.uint8), wscales, torch.bfloat16)
-    # wgt_deq: [N, K] bf16
+    omni = _get_omni()
+    if alpha is None:
+        alpha = 1.0
 
-    # --- Step 2: Dequantize activations via ESIMD kernel ---
-    # ascales is [G, M], act is [M, K/2] packed
-    act_deq = _svdq.dequantize_w4(act.view(torch.uint8), ascales, torch.bfloat16)
-    # act_deq: [M, K] bf16
+    M = act.shape[0]
+    N = wgt.shape[0]
 
-    # --- Step 3: Matmul ---
-    result = (act_deq @ wgt_deq.T).float()
-    # result: [M, N] float32
+    # Resolve compute device
+    compute_device = wgt.device if wgt.device.type == "xpu" else act.device
 
-    # --- Step 4: Post-processing ---
-    if alpha is not None and alpha != 1.0:
-        result = result * float(alpha)
+    # Move tensors to compute device
+    act_dev = act.to(compute_device) if act.device != compute_device else act
+    wgt_dev = wgt.to(compute_device) if wgt.device != compute_device else wgt
+    ascales_dev = ascales.to(compute_device) if ascales.device != compute_device else ascales
+    wscales_dev = wscales.to(compute_device) if wscales.device != compute_device else wscales
+
+    # Get pre-converted oneDNN weights
+    packed_u4, scales_f16 = _get_prepared_weights(wgt_dev, wscales_dev)
+
+    # Step 1: Dequantize activations from INT4 to bf16
+    act_u8 = act_dev.view(torch.uint8)
+    act_bf16 = omni.svdq.dequantize_w4(act_u8, ascales_dev, torch.bfloat16)
+
+    # Step 2: Main W4 GEMM via oneDNN
+    result = omni.svdq.onednn_int4_gemm_preconverted(act_bf16, packed_u4, scales_f16)
+
+    # Step 3: Apply alpha scaling
+    if alpha != 1.0:
+        result = result * alpha
+
+    # Step 4: Apply per-channel scales (wcscales)
     if wcscales is not None:
-        result = result * wcscales.float().view(1, -1)
+        result = result * wcscales.to(result.dtype).view(1, -1)
 
-    # LoRA residual
+    # Step 5: LoRA residual (move to compute device if needed)
     if lora_act_in is not None:
-        from .cpu_ops import compute_lora_bias_residual_cpu
-        lora_contrib = compute_lora_bias_residual_cpu(
-            lora_act_in=lora_act_in,
-            lora_up=lora_up,
-            bias=bias,
-            lora_mode=lora_mode,
-            lora_up_effective=lora_up_effective,
-            bias_effective=bias_effective,
-            lora_scales=lora_scales,
+        lora_act_dev = lora_act_in.to(compute_device) if lora_act_in.device != compute_device else lora_act_in
+        lora_up_dev = lora_up.to(compute_device) if lora_up is not None and lora_up.device != compute_device else lora_up
+        bias_dev = bias.to(compute_device) if bias is not None and bias.device != compute_device else bias
+        lora_up_eff_dev = lora_up_effective.to(compute_device) if lora_up_effective is not None and lora_up_effective.device != compute_device else lora_up_effective
+        bias_eff_dev = bias_effective.to(compute_device) if bias_effective is not None and bias_effective.device != compute_device else bias_effective
+        lora_contrib = _compute_lora_residual_xpu(
+            lora_act_dev, lora_up_dev, bias_dev, lora_mode,
+            lora_up_eff_dev, bias_eff_dev, lora_scales,
         )
-        result = result + lora_contrib
+        result = result + lora_contrib.to(result.dtype)
     elif bias is not None:
-        result = result + bias.float()
+        result = result + bias.to(compute_device).to(result.dtype).view(1, -1)
 
+    # Step 6: Fuse SiLU (for SwiGLU in fused_gelu_mlp path)
     if fuse_silu:
         result = result * torch.sigmoid(result)
 
-    # --- Step 5: Write outputs ---
+    # Step 7: Write to output buffer(s)
     if out is not None:
         M_out = out.shape[0]
         N_out = out.shape[1]
-        out.copy_(result[:M_out, :N_out].to(out.dtype))
+        out.copy_(result[:M_out, :N_out].to(out.dtype).to(out.device))
 
-    # Re-quantize output for fused GEMM chain (e.g., fused_gelu_mlp)
+    # Step 8: Handle qout path (fused_gelu_mlp: quantize output for next layer)
     if qout is not None and oscales is not None:
         _quantize_output_for_next_layer_xpu(
-            result, qout, oscales, lora_down, lora_act_out, smooth_factor
+            result, qout, oscales, lora_down, lora_act_out, smooth_factor,
         )
 
 
-def svdq_gemm_w4a4_xpu_bf16act(
-    act_bf16: torch.Tensor,
-    wgt: torch.Tensor,
-    wscales: torch.Tensor,
-    out: torch.Tensor | None = None,
-    lora_act_in: torch.Tensor | None = None,
-    lora_up: torch.Tensor | None = None,
-    bias: torch.Tensor | None = None,
-    lora_scales: list[float] | None = None,
-    fuse_silu: bool = False,
-    alpha: float | None = 1.0,
-    wcscales: torch.Tensor | None = None,
-    lora_mode: str = "naive",
-    lora_up_effective: torch.Tensor | None = None,
-    bias_effective: torch.Tensor | None = None,
-    wgt_u4: torch.Tensor | None = None,
-    wscales_f16: torch.Tensor | None = None,
-) -> None:
-    """
-    XPU optimized GEMM that skips activation quantization entirely.
+def _compute_lora_residual_xpu(
+    lora_act_in, lora_up, bias, lora_mode,
+    lora_up_effective, bias_effective, lora_scales,
+):
+    """Compute LoRA residual: lora_act @ lora_up.T + bias."""
+    lora_act = lora_act_in.float()
 
-    Instead of:  bf16 act → quantize to INT4 → dequantize back to bf16 → matmul
-    We do:       bf16 act → convert to f16 → oneDNN fused INT4 dequant+GEMM
+    # Apply per-group lora_scales
+    if lora_scales is not None and len(lora_scales) > 0:
+        rank = lora_act.shape[1]
+        scale_t = torch.ones(rank, dtype=torch.float32, device=lora_act.device)
+        for g, s in enumerate(lora_scales):
+            start = g * 16
+            end = min(start + 16, rank)
+            if start >= rank:
+                break
+            scale_t[start:end] = float(s)
+        lora_act = lora_act * scale_t.view(1, -1)
 
-    When oneDNN is available and pre-converted weights (wgt_u4, wscales_f16) are
-    provided, uses the fast oneDNN f16×u4 path which is ~1.54x faster than
-    separate ESIMD dequant + bf16 matmul.
+    if lora_mode == "naive":
+        if lora_up is None:
+            raise ValueError("lora_up is required for lora_mode='naive'")
+        residual = lora_act @ lora_up.float().T
+        if bias is not None:
+            residual = residual + bias.float().view(1, -1)
+        return residual
 
-    Args:
-        act_bf16: [M, K] bf16 activations (already divided by smooth_factor)
-        wgt: [N, K/2] packed INT4 weights (used for fallback path)
-        wscales: [G, N] weight scales bf16 (used for fallback path)
-        out: [M, N] output tensor (required)
-        wgt_u4: [N, K/2] pre-converted unsigned u4 weights (packed ^ 0x88)
-        wscales_f16: [G, N] pre-converted f16 weight scales
-        lora_act_in, lora_up, bias, etc: standard post-processing params
-    """
-    # --- Compute LoRA residual in bf16 (needed before GEMM for append_sum path) ---
-    input_dtype = act_bf16.dtype
-    residual = None
-    if lora_act_in is not None:
-        lora_act = lora_act_in  # already in input_dtype (bf16)
-        if lora_scales is not None and len(lora_scales) > 0:
-            rank = lora_act.shape[1]
-            scale_t = torch.ones(rank, dtype=input_dtype, device=lora_act.device)
-            for g, s in enumerate(lora_scales):
-                start = g * 16
-                end = min(start + 16, rank)
-                if start >= rank:
-                    break
-                scale_t[start:end] = s
-            lora_act = lora_act * scale_t.view(1, -1)
+    if lora_mode == "effective_linear":
+        if lora_up_effective is None:
+            raise ValueError("lora_up_effective required for effective_linear mode")
+        residual = lora_act @ lora_up_effective.float()
+        if bias_effective is not None:
+            residual = residual + bias_effective.float().view(1, -1)
+        return residual
 
-        if lora_mode == "naive":
-            if lora_up is None:
-                raise ValueError("lora_up is required for lora_mode='naive'")
-            residual = lora_act @ lora_up.T  # bf16 matmul — safe from overflow
-            if bias is not None:
-                residual = residual + bias.view(1, -1)
-        elif lora_mode == "effective_linear":
-            if lora_up_effective is None:
-                raise ValueError("lora_up_effective is required for lora_mode='effective_linear'")
-            residual = lora_act @ lora_up_effective  # bf16 matmul
-            if bias_effective is not None:
-                residual = residual + bias_effective.view(1, -1)
-        else:
-            raise ValueError(f"Unsupported lora_mode: {lora_mode}")
-
-    # --- Check if we can use the append_sum fast path ---
-    # append_sum: pre-fill out with residual, then GEMM adds result directly.
-    # Eliminates separate fused_convert_add kernel. Saves ~0.17s per image.
-    # Requirements: oneDNN path, residual exists, no SiLU, no alpha/wcscales scaling.
-    _use_append_sum = (
-        _append_sum_available
-        and _onednn_available
-        and wgt_u4 is not None
-        and wscales_f16 is not None
-        and residual is not None
-        and out is not None
-        and not fuse_silu
-        and (alpha is None or alpha == 1.0)
-        and wcscales is None
-    )
-
-    if _use_append_sum:
-        # --- append_sum fast path: out = residual + GEMM(act, wgt) in one primitive ---
-        if input_dtype == torch.float16:
-            act_f16 = act_bf16
-        else:
-            act_f16 = act_bf16.to(torch.float16)
-        out.copy_(residual)
-        _svdq.onednn_int4_gemm_add_to_output(act_f16, wgt_u4, wscales_f16, out)
-        return
-
-    # --- GEMM: oneDNN fused path (f16) or fallback (ESIMD dequant + matmul) ---
-    if _onednn_available and wgt_u4 is not None and wscales_f16 is not None:
-        if input_dtype == torch.float16:
-            act_f16 = act_bf16  # already f16 — no conversion needed
-        else:
-            act_f16 = act_bf16.to(torch.float16)
-        result = _svdq.onednn_int4_gemm_preconverted(act_f16, wgt_u4, wscales_f16)
-        # Keep result in f16 — do post-processing in f16 to avoid conversion overhead.
-        # Convert to output dtype only at the end (via out.copy_).
-        compute_dtype = torch.float16
-    else:
-        wgt_deq = _svdq.dequantize_w4(wgt.view(torch.uint8), wscales, input_dtype)
-        result = act_bf16 @ wgt_deq.T
-        compute_dtype = input_dtype
-
-    # --- Post-processing ---
-    # GEMM result is in compute_dtype (f16 for oneDNN, input_dtype for fallback).
-    # Alpha/wcscales are safe in f16 (small values), but LoRA residuals can exceed
-    # f16 max (65504) so LoRA must be computed in bf16.
-    #
-    # Performance: Using in-place ops (copy_ + add_) is ~4.7x faster than creating
-    # temporary tensors (.to(bf16) → new tensor + add → new tensor + copy_).
-    # We write the GEMM result directly to `out` via copy_ (which handles f16→bf16),
-    # then add LoRA residual and bias in-place.
-    if alpha is not None and alpha != 1.0:
-        result = result * alpha
-    if wcscales is not None:
-        result = result * wcscales.to(compute_dtype).view(1, -1)
-
-    # --- Write output using in-place ops (4.7x faster than separate .to + add + copy) ---
-    if out is not None:
-        M_out = out.shape[0]
-        N_out = out.shape[1]
-        if fuse_silu:
-            # SiLU needs float32 precision — can't do in-place on bf16 out
-            result_f32 = result[:M_out, :N_out].float()
-            result_f32 = result_f32 * torch.sigmoid(result_f32)
-            out.copy_(result_f32)
-            if residual is not None:
-                out.add_(residual[:M_out, :N_out])
-        else:
-            # Fast path: fused_convert_add does f16→bf16 + add in single ESIMD kernel
-            # ~2x faster than separate copy_ + add_ (saves ~0.68s per image)
-            if residual is not None and _fused_convert_add_available:
-                _svdq.fused_convert_add(out, result, residual)
-            else:
-                # copy_ handles f16→bf16 conversion implicitly
-                out.copy_(result[:M_out, :N_out])
-                if residual is not None:
-                    out.add_(residual[:M_out, :N_out])
-                elif bias is not None:
-                    out.add_(bias.to(out.dtype).view(1, -1))
-    elif fuse_silu:
-        # No output tensor — modify result in-place (rare path)
-        if compute_dtype != input_dtype:
-            result = result.to(input_dtype)
-        if residual is not None:
-            result = result + residual
-        result = result.float()
-        result = result * torch.sigmoid(result)
-        result = result.to(input_dtype)
+    raise ValueError(f"Unsupported lora_mode: {lora_mode}")
 
 
 def _quantize_output_for_next_layer_xpu(
-    result: torch.Tensor,
-    qout: torch.Tensor,
-    oscales: torch.Tensor,
-    lora_down: torch.Tensor | None,
-    lora_act_out: torch.Tensor | None,
-    smooth_factor: torch.Tensor | None,
-) -> None:
-    """Re-quantize GEMM output for the next quantized layer using ESIMD kernel."""
+    result, qout, oscales, lora_down, lora_act_out, smooth_factor,
+):
+    """GELU + quantize output for fused_gelu_mlp's second linear."""
+    omni = _get_omni()
     M, N = result.shape
     M_pad = qout.shape[0]
+    shift_gelu = 0.171875
 
-    x = result.float()
+    # Ensure all computation on same device as result
+    compute_device = result.device
 
-    # LoRA down-projection for next layer
+    # GELU activation
+    x_gelu = F.gelu(result.float(), approximate="tanh")
+
+    # LoRA down projection for next layer
     if lora_down is not None and lora_act_out is not None:
-        lora_act_out[:M].copy_((x @ lora_down.float())[:M])
+        ld = lora_down.to(compute_device) if lora_down.device != compute_device else lora_down
+        lora_result = (x_gelu @ ld.float())[:M]
+        lora_act_out[:M].copy_(lora_result.to(lora_act_out.dtype).to(lora_act_out.device))
         if M_pad > M:
             lora_act_out[M:].zero_()
 
-    # Apply smooth factor
+    # Add shift for unsigned quantization
+    x = x_gelu + shift_gelu
+
+    # Apply smooth factor for next layer
     if smooth_factor is not None:
-        x = x / smooth_factor.float()
+        sf = smooth_factor.to(compute_device) if smooth_factor.device != compute_device else smooth_factor
+        rcp_smooth = (1.0 / sf.float()).to(torch.float16)
+        x_f16 = omni.svdq.fused_smooth_mul_convert(x.to(torch.bfloat16), rcp_smooth)
+    else:
+        x_f16 = x.to(torch.float16)
 
-    # ESIMD quantize_act_int4: [M, N] → ([M, N/2], [G, M])
-    packed, scales = _svdq.quantize_act_int4(x, group_size=64)
-
-    qout[:M].copy_(packed)
+    # Pad
     if M_pad > M:
-        qout[M:].zero_()
+        x_padded = torch.zeros(M_pad, N, dtype=x_f16.dtype, device=compute_device)
+        x_padded[:M] = x_f16
+    else:
+        x_padded = x_f16.contiguous()
 
-    oscales[:, :M].copy_(scales.to(oscales.dtype))
-    if M_pad > M:
-        oscales[:, M:].zero_()
+    # Quantize to unsigned INT4
+    packed_act, ascales = omni.svdq.quantize_act_int4(x_padded, group_size=64)
+
+    qout.copy_(packed_act.to(qout.device).view(qout.dtype))
+    oscales.copy_(ascales.to(oscales.dtype).to(oscales.device))
 
 
-# ---------------------------------------------------------------------------
-# AWQ GEMV (W4A16) — no ESIMD kernel, delegate to cpu_ops
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Op 3: awq_gemv_w4a16_xpu
+# ============================================================================
 
 def awq_gemv_w4a16_xpu(
     in_feats: torch.Tensor,
@@ -410,8 +334,57 @@ def awq_gemv_w4a16_xpu(
     k: int,
     group_size: int = 64,
 ) -> torch.Tensor:
-    """AWQ GEMV on XPU — uses cpu_ops (PyTorch native ops work on XPU)."""
-    from .cpu_ops import awq_gemv_w4a16_cpu
-    return awq_gemv_w4a16_cpu(
-        in_feats, kernel, scaling_factors, zeros, m, n, k, group_size
+    """XPU implementation of AWQ W4A16 GEMV.
+
+    AWQ dequantize + standard matmul. The AWQ packed format uses int16 tiles
+    with a specific permutation pattern (from nunchaku's cpu_ops.py).
+    """
+    weight = _awq_dequantize_xpu(kernel, scaling_factors, zeros, n, k, group_size)
+    x = in_feats.float().reshape(m, k)
+    output = x @ weight.float().T
+    return output.to(in_feats.dtype)
+
+
+def _awq_dequantize_xpu(
+    kernel: torch.Tensor,
+    scaling_factors: torch.Tensor,
+    zeros: torch.Tensor,
+    n: int,
+    k: int,
+    group_size: int,
+) -> torch.Tensor:
+    """Dequantize AWQ int4 weights to float.
+
+    Mirrors cpu_ops.awq_dequantize_weights exactly for correctness.
+    """
+    # Unpack using the same algorithm as cpu_ops.awq_unpack_weights
+    packed16 = kernel.view(torch.int16).reshape(n // 4, k)
+    packed = (
+        packed16.reshape(n // 4, k // 64, 4, 16)
+        .permute(0, 2, 1, 3)
+        .reshape(n, k // 32, 8)
+        .to(torch.int32)
     )
+
+    masks = torch.tensor(
+        [0xF, 0xF0, 0xF00, 0xF000], dtype=torch.int32, device=packed.device
+    )
+    shifts = torch.tensor([0, 4, 8, 12], dtype=torch.int32, device=packed.device)
+    parts = ((packed.unsqueeze(-1) & masks) >> shifts).to(torch.float32)
+
+    weight = torch.zeros(n, k // 32, 32, dtype=torch.float32, device=packed.device)
+    for idx in range(8):
+        weight[:, :, idx] = parts[:, :, idx, 0]
+        weight[:, :, idx + 8] = parts[:, :, idx, 1]
+        weight[:, :, idx + 16] = parts[:, :, idx, 2]
+        weight[:, :, idx + 24] = parts[:, :, idx, 3]
+
+    weight = weight.reshape(n, k)
+
+    # Dequantize: weight = weight * scale + zero
+    num_groups = k // group_size
+    weight = weight.view(n, num_groups, group_size)
+    sc = scaling_factors.float().T.unsqueeze(-1)
+    zp = zeros.float().T.unsqueeze(-1)
+    dequant = weight * sc + zp
+    return dequant.view(n, k)

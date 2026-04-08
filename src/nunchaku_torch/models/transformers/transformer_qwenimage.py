@@ -18,11 +18,9 @@ from diffusers.utils import logging as diffusers_logging
 from huggingface_hub import utils
 
 from ...utils import get_precision
-
-try:
-    from ..._C import ops as _C_ops
-except ImportError:
-    _C_ops = None
+from ...ops.gemm import _C_ops as _GEMM_C_OPS
+from ...ops.gemv import _C_ops as _GEMV_C_OPS
+from ...ops.quantize import _C_ops as _QUANT_C_OPS
 from ..attention import NunchakuBaseAttention, NunchakuFeedForward
 from ..attention_processors.qwenimage import NunchakuQwenImageNaiveFA2Processor
 from ..linear import AWQW4A16Linear, SVDQW4A4Linear
@@ -228,6 +226,7 @@ class NunchakuQwenImageTransformer2DModel(
         device = kwargs.get("device", "cpu")
         offload = kwargs.get("offload", False)
         torch_dtype = kwargs.get("torch_dtype", torch.bfloat16)
+        cpu_kernel_layout = kwargs.pop("cpu_kernel_layout", True)
 
         if isinstance(pretrained_model_name_or_path, str):
             pretrained_model_name_or_path = Path(pretrained_model_name_or_path)
@@ -263,9 +262,17 @@ class NunchakuQwenImageTransformer2DModel(
             if not isinstance(device, torch.device)
             else device.type
         )
-        if (device_type != "cuda" or _C_ops is None) and precision == "int4":
-            # CPU / XPU / any device without _C_ops:
-            # decode weights from CUDA tile layout to row-major for cpu_ops
+        needs_cpu_int4_layout = (
+            device_type in ("cpu", "xpu")
+            and precision == "int4"
+            and (
+                cpu_kernel_layout
+                or _GEMM_C_OPS is None
+                or _QUANT_C_OPS is None
+                or _GEMV_C_OPS is None
+            )
+        )
+        if needs_cpu_int4_layout:
             decode_int4_state_dict_for_cpu(model_state_dict)
 
         patch_scale_key(transformer, model_state_dict)
@@ -392,8 +399,11 @@ class NunchakuQwenImageTransformer2DModel(
         hidden_states = self.norm_out(hidden_states, temb)
         output = self.proj_out(hidden_states)
 
-        if self.offload and torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if self.offload:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            elif hasattr(torch, "xpu") and torch.xpu.is_available():
+                torch.xpu.empty_cache()
 
         if not return_dict:
             return (output,)

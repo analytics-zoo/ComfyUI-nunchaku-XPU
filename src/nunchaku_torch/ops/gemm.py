@@ -8,7 +8,11 @@ except ImportError:
     _C_ops = None
 
 from .cpu_ops import svdq_gemm_w4a4_cpu
-from .xpu_ops import is_available as _xpu_kernels_available, svdq_gemm_w4a4_xpu
+
+try:
+    from .xpu_ops import svdq_gemm_w4a4_xpu as _xpu_gemm
+except ImportError:
+    _xpu_gemm = None
 
 
 def svdq_gemm_w4a4_cuda(
@@ -57,39 +61,19 @@ def svdq_gemm_w4a4_cuda(
     if alpha is None:
         alpha = 1.0
 
-    if act.device.type == "xpu" and _xpu_kernels_available():
-        svdq_gemm_w4a4_xpu(
-            act=act,
-            wgt=wgt,
-            out=out,
-            qout=qout,
-            ascales=ascales,
-            wscales=wscales,
-            oscales=oscales,
-            poolout=poolout,
-            lora_act_in=lora_act_in,
-            lora_up=lora_up,
-            lora_down=lora_down,
-            lora_act_out=lora_act_out,
-            norm_q=norm_q,
-            norm_k=norm_k,
-            rotary_emb=rotary_emb,
-            bias=bias,
-            smooth_factor=smooth_factor,
-            out_vk=out_vk,
-            out_linearattn=out_linearattn,
-            act_unsigned=act_unsigned,
-            lora_scales=lora_scales,
-            fuse_silu=fuse_silu,
-            fp4=fp4,
-            alpha=alpha,
-            wcscales=wcscales,
-            out_q=out_q,
-            out_k=out_k,
-            out_v=out_v,
-            attn_tokens=attn_tokens,
-            lora_mode=lora_mode,
-            lora_up_effective=lora_up_effective,
+    _has_xpu = (act.device.type == "xpu" or wgt.device.type == "xpu")
+    if _has_xpu and _xpu_gemm is not None:
+        _xpu_gemm(
+            act=act, wgt=wgt, out=out, qout=qout,
+            ascales=ascales, wscales=wscales, oscales=oscales, poolout=poolout,
+            lora_act_in=lora_act_in, lora_up=lora_up, lora_down=lora_down,
+            lora_act_out=lora_act_out, norm_q=norm_q, norm_k=norm_k,
+            rotary_emb=rotary_emb, bias=bias, smooth_factor=smooth_factor,
+            out_vk=out_vk, out_linearattn=out_linearattn,
+            act_unsigned=act_unsigned, lora_scales=lora_scales,
+            fuse_silu=fuse_silu, fp4=fp4, alpha=alpha, wcscales=wcscales,
+            out_q=out_q, out_k=out_k, out_v=out_v, attn_tokens=attn_tokens,
+            lora_mode=lora_mode, lora_up_effective=lora_up_effective,
             bias_effective=bias_effective,
         )
         return

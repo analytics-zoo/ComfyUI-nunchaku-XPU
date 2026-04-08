@@ -57,13 +57,8 @@ class NunchakuQwenImageNaiveFA2Processor:
         joint_value = torch.cat([txt_value, img_value], dim=1)
 
         joint_hidden_states = dispatch_attention_fn(
-            joint_query,
-            joint_key,
-            joint_value,
-            attn_mask=attention_mask,
-            dropout_p=0.0,
-            is_causal=False,
-            backend=None,
+            joint_query, joint_key, joint_value,
+            attn_mask=attention_mask, dropout_p=0.0, is_causal=False, backend=None,
         )
 
         joint_hidden_states = joint_hidden_states.flatten(2, 3)

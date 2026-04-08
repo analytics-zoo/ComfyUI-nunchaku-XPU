@@ -5,7 +5,6 @@ from typing import List, Optional, cast
 
 import torch
 import torch.nn as nn
-
 from diffusers.models.attention import FeedForward
 from diffusers.models.attention_processor import Attention
 from diffusers.models.normalization import RMSNorm
@@ -26,16 +25,6 @@ from ..unets.unet_sdxl import NunchakuSDXLFeedForward
 from ..utils import fuse_linears
 from ...ops.gemm import svdq_gemm_w4a4_cuda
 from ...ops.quantize import svdq_quantize_w4a4_act_fuse_lora_cuda
-from ...ops.xpu_ops import is_available as _xpu_kernels_available, svdq_gemm_w4a4_xpu_bf16act
-
-# XPU ESIMD kernels for fused norm / rotary (optional, from omni_xpu_kernel)
-try:
-    from omni_xpu_kernel import norm as _esimd_norm, rotary as _esimd_rotary
-    _esimd_norm_rotary_available = True
-except ImportError:
-    _esimd_norm = None
-    _esimd_rotary = None
-    _esimd_norm_rotary_available = False
 from ...utils import get_precision, pad_tensor
 from .utils import (
     NunchakuModelLoaderMixin,
@@ -43,16 +32,6 @@ from .utils import (
     decode_int4_state_dict_for_cpu,
     patch_scale_key,
 )
-
-try:
-    from ..._C import ops as _C_ops
-except ImportError:
-    _C_ops = None
-
-
-def _use_cuda_fused_kernels(device_type: str) -> bool:
-    """Return True only when CUDA fused kernels are actually available."""
-    return device_type == "cuda" and _C_ops is not None
 
 
 class NunchakuZImageRopeHook:
@@ -82,160 +61,174 @@ class NunchakuZImageFusedModule(nn.Module):
             setattr(self, name.replace(".", ""), param)
         self.qkv_precision = qkv.precision
         self.qkv_out_features = qkv.out_features
-        self.qkv_in_features = qkv.in_features
-        self.qkv_group_size = qkv.group_size
-        self.qkv_torch_dtype = qkv.torch_dtype
         for name, param in norm_q.named_parameters(prefix="norm_q_"):
             setattr(self, name.replace(".", ""), param)
         for name, param in norm_k.named_parameters(prefix="norm_k_"):
             setattr(self, name.replace(".", ""), param)
 
     @staticmethod
-    def _apply_rmsnorm(
+    def _apply_rmsnorm_cpu(
         x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
     ) -> torch.Tensor:
+        if x.device.type == "xpu":
+            try:
+                from omni_xpu_kernel import norm as omni_norm
+                # omni rms_norm needs 2D [batch, hidden_size]
+                orig_shape = x.shape
+                hidden = orig_shape[-1]
+                x_2d = x.reshape(-1, hidden)
+                out_2d = omni_norm.rms_norm(weight, x_2d, eps)
+                return out_2d.reshape(orig_shape)
+            except (ImportError, RuntimeError):
+                pass
         variance = x.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
         out = x * torch.rsqrt(variance + eps)
         return (out.to(weight.dtype) * weight).to(x.dtype)
 
     @staticmethod
-    def _apply_rotary_emb(
+    def _apply_rotary_emb_cpu(
         x_in: torch.Tensor, freqs_cis: torch.Tensor
     ) -> torch.Tensor:
-        # Disable autocast regardless of device type (cpu, cuda, xpu, ...)
-        device_type = x_in.device.type if x_in.device.type != "meta" else "cpu"
+        # XPU: try omni_xpu_kernel.rotary for ESIMD-optimized rotary
+        if x_in.device.type == "xpu":
+            try:
+                from omni_xpu_kernel import rotary as omni_rotary
+                # Convert complex freqs_cis to cos/sin caches
+                if freqs_cis.is_complex():
+                    freqs_real = torch.view_as_real(freqs_cis)  # [..., head_dim/2, 2]
+                else:
+                    freqs_real = freqs_cis.float().reshape(*freqs_cis.shape[:-1], -1, 2)
+                # freqs_real: [B?, seq_total, head_dim/2, 2] where [...,0]=cos, [...,1]=sin
+                # But complex multiplication: (a+bi)(c+di) = (ac-bd) + (ad+bc)i
+                # freqs_cis = cos + i*sin, so real part = cos, imag part = sin
+
+                # omni rotary expects: x=[total_rows, head_dim], cos=[S, D/2], sin=[S, D/2]
+                B, S, H, D = x_in.shape
+                seq_len = S
+
+                # Extract cos/sin from complex freqs
+                if freqs_cis.is_complex():
+                    fc = freqs_cis
+                    if fc.shape[-2] > seq_len:
+                        fc = fc[..., :seq_len, :]
+                    cos_cache = fc.real.float()  # [..., seq, head_dim/2]
+                    sin_cache = fc.imag.float()
+                else:
+                    fc = freqs_real
+                    if fc.shape[-3] > seq_len:
+                        fc = fc[..., :seq_len, :, :]
+                    cos_cache = fc[..., 0].float()
+                    sin_cache = fc[..., 1].float()
+
+                # Squeeze batch dim if present
+                if cos_cache.ndim > 2:
+                    cos_cache = cos_cache.squeeze(0)
+                    sin_cache = sin_cache.squeeze(0)
+                # cos_cache: [seq, head_dim/2], sin_cache: [seq, head_dim/2]
+
+                # omni rotary: x=[total_rows, head_dim]
+                x_flat = x_in.reshape(B * S * H, D)
+                out_flat = omni_rotary.rotary_emb(x_flat, cos_cache, sin_cache, seq_len, H)
+                return out_flat.reshape(B, S, H, D)
+            except (ImportError, RuntimeError):
+                pass  # fallback to PyTorch
+
+        device_type = x_in.device.type if x_in.device.type in ("cuda",) else "cpu"
         with torch.amp.autocast(device_type, enabled=False):
             x = torch.view_as_complex(x_in.float().reshape(*x_in.shape[:-1], -1, 2))
+            if not freqs_cis.is_complex():
+                freqs_cis = torch.view_as_complex(
+                    freqs_cis.float().reshape(*freqs_cis.shape[:-1], -1, 2)
+                )
+            seq_len = x.shape[1]
+            if freqs_cis.shape[-2] > seq_len:
+                freqs_cis = freqs_cis[..., :seq_len, :]
             x_out = torch.view_as_real(x * freqs_cis.unsqueeze(2)).flatten(3)
             return x_out.type_as(x_in)
+
+    def _forward_xpu(self, x, freqs_cis, norm_q_weight, norm_k_weight):
+        """XPU path: direct W4A16 GEMM (no activation quantization).
+
+        Handles CPU input transparently: moves to XPU for GEMM, back to input device for output.
+        """
+        from omni_xpu_kernel import svdq as omni_svdq
+
+        input_device = x.device
+        x_orig_dtype = x.dtype
+        batch_size, seq_len, channels = x.shape
+        xpu_device = cast(torch.Tensor, self.qkv_qweight).device
+
+        x_flat = x.view(batch_size * seq_len, channels)
+        if x_flat.device != xpu_device:
+            x_flat = x_flat.to(xpu_device)
+
+        # Apply smooth factor (rcp cached)
+        smooth = cast(torch.Tensor, self.qkv_smooth_factor)
+        if smooth is not None:
+            if not hasattr(self, '_xpu_rcp_smooth') or self._xpu_rcp_smooth is None:
+                self._xpu_rcp_smooth = (1.0 / smooth.float()).to(torch.float16)
+            x_gemm = omni_svdq.fused_smooth_mul_convert(x_flat, self._xpu_rcp_smooth).to(torch.bfloat16)
+        else:
+            x_gemm = x_flat.to(torch.bfloat16)
+
+        # Prepare oneDNN weights (cached)
+        qweight = cast(torch.Tensor, self.qkv_qweight)
+        wscales = cast(torch.Tensor, self.qkv_wscales)
+        if not hasattr(self, '_xpu_qkv_u4') or self._xpu_qkv_u4 is None:
+            self._xpu_qkv_u4, self._xpu_qkv_scales = omni_svdq.prepare_onednn_weights(
+                qweight.view(torch.uint8), wscales
+            )
+
+        # W4A16 GEMM
+        output = omni_svdq.onednn_int4_gemm_preconverted(
+            x_gemm, self._xpu_qkv_u4, self._xpu_qkv_scales
+        )
+
+        # LoRA
+        proj_down = cast(torch.Tensor, self.qkv_proj_down)
+        proj_up = cast(torch.Tensor, self.qkv_proj_up)
+        if proj_down is not None and proj_up is not None:
+            lora_act = x_flat.to(torch.bfloat16) @ proj_down.to(torch.bfloat16)
+            lora_out = lora_act @ proj_up.to(torch.bfloat16).T
+            output = output.to(torch.bfloat16) + lora_out
+
+        # Bias
+        qkv_bias = cast(Optional[torch.Tensor], getattr(self, "qkv_bias", None))
+        if qkv_bias is not None:
+            output = output.to(torch.bfloat16) + qkv_bias.to(torch.bfloat16)
+
+        # All subsequent ops happen on the same device as the GEMM result
+        output = output.to(x_orig_dtype).view(batch_size, seq_len, -1)
+
+        # Split Q, K, V and apply norm + rotary
+        query, key, value = output.chunk(3, dim=-1)
+        head_dim = int(norm_q_weight.numel())
+        heads = query.shape[-1] // head_dim
+
+        query = query.view(batch_size, seq_len, heads, head_dim)
+        key = key.view(batch_size, seq_len, heads, head_dim)
+        value = value.view(batch_size, seq_len, heads, head_dim)
+
+        query = self._apply_rmsnorm_cpu(query, norm_q_weight)
+        key = self._apply_rmsnorm_cpu(key, norm_k_weight)
+        if freqs_cis is not None:
+            query = self._apply_rotary_emb_cpu(query, freqs_cis)
+            key = self._apply_rotary_emb_cpu(key, freqs_cis)
+
+        output = torch.cat(
+            [query.flatten(2, 3), key.flatten(2, 3), value.flatten(2, 3)], dim=-1
+        )
+        return output
 
     def forward(self, x: torch.Tensor, freqs_cis: Optional[torch.Tensor] = None):
         batch_size, seq_len, channels = x.shape
         norm_q_weight = cast(torch.Tensor, self.norm_q_weight)
         norm_k_weight = cast(torch.Tensor, self.norm_k_weight)
 
-        device_type = x.device.type
-        if not _use_cuda_fused_kernels(device_type):
-            # --- Non-CUDA path: quantized GEMM + manual norm/rotary ---
-            x_2d = x.view(batch_size * seq_len, channels)
+        # XPU: always use direct W4A16 path (better precision)
+        if cast(torch.Tensor, self.qkv_qweight).device.type == "xpu":
+            return self._forward_xpu(x, freqs_cis, norm_q_weight, norm_k_weight)
 
-            qkv_proj_down = cast(torch.Tensor, self.qkv_proj_down)
-            qkv_smooth_factor = cast(torch.Tensor, self.qkv_smooth_factor)
-            qkv_qweight = cast(torch.Tensor, self.qkv_qweight)
-            qkv_wscales = cast(torch.Tensor, self.qkv_wscales)
-            qkv_proj_up = cast(torch.Tensor, self.qkv_proj_up)
-            qkv_bias = cast(Optional[torch.Tensor], getattr(self, "qkv_bias", None))
-            qkv_wcscales = cast(
-                Optional[torch.Tensor], getattr(self, "qkv_wcscales", None)
-            )
-
-            output = torch.empty(
-                batch_size * seq_len,
-                self.qkv_out_features,
-                dtype=x.dtype,
-                device=x.device,
-            )
-
-            # XPU optimization: skip activation INT4 quantize+dequant round-trip
-            if device_type == "xpu" and _xpu_kernels_available():
-                if not hasattr(self, '_qkv_wgt_u4'):
-                    try:
-                        from omni_xpu_kernel.svdq import prepare_onednn_weights
-                        u4, sf16 = prepare_onednn_weights(qkv_qweight.view(torch.uint8), qkv_wscales)
-                        self._qkv_wgt_u4 = u4
-                        self._qkv_wscales_f16 = sf16
-                        self.qkv_qweight.data = torch.empty(0, dtype=torch.int8, device=x.device)
-                        self.qkv_wscales.data = torch.empty(0, dtype=self.qkv_wscales.dtype, device=x.device)
-                    except (ImportError, AttributeError):
-                        self._qkv_wgt_u4 = None
-                        self._qkv_wscales_f16 = None
-
-                lora_act_out = x_2d @ qkv_proj_down
-                act_smoothed = x_2d / qkv_smooth_factor
-                svdq_gemm_w4a4_xpu_bf16act(
-                    act_bf16=act_smoothed,
-                    wgt=qkv_qweight,
-                    wscales=qkv_wscales,
-                    out=output,
-                    lora_act_in=lora_act_out,
-                    lora_up=qkv_proj_up,
-                    bias=qkv_bias,
-                    alpha=1.0 if self.qkv_precision == "nvfp4" else None,
-                    wcscales=qkv_wcscales if self.qkv_precision == "nvfp4" else None,
-                    wgt_u4=self._qkv_wgt_u4,
-                    wscales_f16=self._qkv_wscales_f16,
-                )
-            else:
-                quantized_x, ascales, lora_act_out = svdq_quantize_w4a4_act_fuse_lora_cuda(
-                    x_2d,
-                    lora_down=qkv_proj_down,
-                    smooth=qkv_smooth_factor,
-                    fp4=self.qkv_precision == "nvfp4",
-                    pad_size=256,
-                )
-                svdq_gemm_w4a4_cuda(
-                    act=quantized_x,
-                    wgt=qkv_qweight,
-                    out=output,
-                    ascales=ascales,
-                    wscales=qkv_wscales,
-                    lora_act_in=lora_act_out,
-                    lora_up=qkv_proj_up,
-                    bias=qkv_bias,
-                    fp4=self.qkv_precision == "nvfp4",
-                    alpha=1.0 if self.qkv_precision == "nvfp4" else None,
-                    wcscales=qkv_wcscales if self.qkv_precision == "nvfp4" else None,
-                )
-
-            output = output.view(batch_size, seq_len, -1)
-
-            # Split QKV, apply norms and rotary
-            query, key, value = output.chunk(3, dim=-1)
-            head_dim = int(norm_q_weight.numel())
-            if query.shape[-1] % head_dim != 0:
-                raise ValueError(
-                    f"query dim {query.shape[-1]} is not divisible by head_dim {head_dim}"
-                )
-            heads = query.shape[-1] // head_dim
-
-            query = query.view(batch_size, seq_len, heads, head_dim)
-            key = key.view(batch_size, seq_len, heads, head_dim)
-            value = value.view(batch_size, seq_len, heads, head_dim)
-
-            if device_type == "xpu" and _esimd_norm_rotary_available:
-                # ESIMD RMSNorm: 3.43x faster than PyTorch
-                flat_q = query.reshape(-1, head_dim).contiguous()
-                flat_k = key.reshape(-1, head_dim).contiguous()
-                query = _esimd_norm.rms_norm(norm_q_weight, flat_q, 1e-6).reshape(
-                    batch_size, seq_len, heads, head_dim
-                )
-                key = _esimd_norm.rms_norm(norm_k_weight, flat_k, 1e-6).reshape(
-                    batch_size, seq_len, heads, head_dim
-                )
-
-                if freqs_cis is not None:
-                    # ESIMD Rotary: 5.61x faster than PyTorch
-                    # freqs_cis is [B, S, HD/2] complex64; extract cos/sin as [S, HD/2] f32
-                    cos_cache = freqs_cis[0].real.contiguous()
-                    sin_cache = freqs_cis[0].imag.contiguous()
-                    flat_q = query.reshape(-1, head_dim).contiguous()
-                    flat_k = key.reshape(-1, head_dim).contiguous()
-                    query = _esimd_rotary.rotary_emb(
-                        flat_q, cos_cache, sin_cache, seq_len, heads
-                    ).reshape(batch_size, seq_len, heads, head_dim)
-                    key = _esimd_rotary.rotary_emb(
-                        flat_k, cos_cache, sin_cache, seq_len, heads
-                    ).reshape(batch_size, seq_len, heads, head_dim)
-            else:
-                query = self._apply_rmsnorm(query, norm_q_weight)
-                key = self._apply_rmsnorm(key, norm_k_weight)
-                if freqs_cis is not None:
-                    query = self._apply_rotary_emb(query, freqs_cis)
-                    key = self._apply_rotary_emb(key, freqs_cis)
-
-            return query, key, value
-
-        # --- Original CUDA path (unchanged) ---
         x = x.view(batch_size * seq_len, channels)
         qkv_proj_down = cast(torch.Tensor, self.qkv_proj_down)
         qkv_smooth_factor = cast(torch.Tensor, self.qkv_smooth_factor)
@@ -254,31 +247,65 @@ class NunchakuZImageFusedModule(nn.Module):
         output = torch.empty(
             batch_size * seq_len, self.qkv_out_features, dtype=x.dtype, device=x.device
         )
-        # CUDA with _C_ops: fused norm + rotary inside the GEMM kernel
-        svdq_gemm_w4a4_cuda(
-            act=quantized_x,
-            wgt=qkv_qweight,
-            out=output,
-            ascales=ascales,
-            wscales=qkv_wscales,
-            lora_act_in=lora_act_out,
-            lora_up=qkv_proj_up,
-            bias=qkv_bias,
-            fp4=self.qkv_precision == "nvfp4",
-            alpha=1.0 if self.qkv_precision == "nvfp4" else None,
-            wcscales=qkv_wcscales if self.qkv_precision == "nvfp4" else None,
-            norm_q=norm_q_weight,
-            norm_k=norm_k_weight,
-            rotary_emb=freqs_cis,
-        )
-        output = output.view(batch_size, seq_len, -1)
-        head_dim = int(norm_q_weight.numel())
-        heads = output.shape[-1] // (3 * head_dim)
-        query, key, value = output.chunk(3, dim=-1)
-        query = query.view(batch_size, seq_len, heads, head_dim)
-        key = key.view(batch_size, seq_len, heads, head_dim)
-        value = value.view(batch_size, seq_len, heads, head_dim)
-        return query, key, value
+        if x.device.type == "cpu":
+            svdq_gemm_w4a4_cuda(
+                act=quantized_x,
+                wgt=qkv_qweight,
+                out=output,
+                ascales=ascales,
+                wscales=qkv_wscales,
+                lora_act_in=lora_act_out,
+                lora_up=qkv_proj_up,
+                bias=qkv_bias,
+                fp4=self.qkv_precision == "nvfp4",
+                alpha=1.0 if self.qkv_precision == "nvfp4" else None,
+                wcscales=qkv_wcscales if self.qkv_precision == "nvfp4" else None,
+                norm_q=None,
+                norm_k=None,
+                rotary_emb=None,
+            )
+
+            output = output.view(batch_size, seq_len, -1)
+            query, key, value = output.chunk(3, dim=-1)
+            head_dim = int(norm_q_weight.numel())
+            if query.shape[-1] % head_dim != 0:
+                raise ValueError(
+                    f"query dim {query.shape[-1]} is not divisible by head_dim {head_dim}"
+                )
+            heads = query.shape[-1] // head_dim
+
+            query = query.view(batch_size, seq_len, heads, head_dim)
+            key = key.view(batch_size, seq_len, heads, head_dim)
+            value = value.view(batch_size, seq_len, heads, head_dim)
+
+            query = self._apply_rmsnorm_cpu(query, norm_q_weight)
+            key = self._apply_rmsnorm_cpu(key, norm_k_weight)
+            if freqs_cis is not None:
+                query = self._apply_rotary_emb_cpu(query, freqs_cis)
+                key = self._apply_rotary_emb_cpu(key, freqs_cis)
+
+            output = torch.cat(
+                [query.flatten(2, 3), key.flatten(2, 3), value.flatten(2, 3)], dim=-1
+            )
+        else:
+            svdq_gemm_w4a4_cuda(
+                act=quantized_x,
+                wgt=qkv_qweight,
+                out=output,
+                ascales=ascales,
+                wscales=qkv_wscales,
+                lora_act_in=lora_act_out,
+                lora_up=qkv_proj_up,
+                bias=qkv_bias,
+                fp4=self.qkv_precision == "nvfp4",
+                alpha=1.0 if self.qkv_precision == "nvfp4" else None,
+                wcscales=qkv_wcscales if self.qkv_precision == "nvfp4" else None,
+                norm_q=norm_q_weight,
+                norm_k=norm_k_weight,
+                rotary_emb=freqs_cis,
+            )
+            output = output.view(batch_size, seq_len, -1)
+        return output
 
 
 class NunchakuZImageAttention(NunchakuBaseAttention):
@@ -414,14 +441,14 @@ class NunchakuZImageTransformer2DModel(
         return_dict: bool = True,
     ):
         model_device = next(self.parameters()).device.type
-        if not _use_cuda_fused_kernels(model_device):
-            # CPU / XPU / any device without _C_ops: standard forward
-            # (no rope hook — freqs_cis stays in complex form for manual rotary)
+        if model_device in ("cpu", "xpu"):
+            # CPU and XPU: use standard diffusers forward (complex freqs_cis)
+            # XPU's _forward_xpu handles complex freqs via _apply_rotary_emb_cpu
             return super().forward(
                 x, t, cap_feats, patch_size, f_patch_size, return_dict
             )
 
-        # CUDA with _C_ops: pack rotary embeddings for fused kernels
+        # CUDA: register RopeHook to convert freqs to packed format for CUDA kernel
         rope_hook = NunchakuZImageRopeHook()
         self.register_rope_hook(rope_hook)
         try:
@@ -483,9 +510,7 @@ class NunchakuZImageTransformer2DModel(
             if not isinstance(device, torch.device)
             else device.type
         )
-        if not _use_cuda_fused_kernels(device_type) and precision == "int4":
-            # CPU / XPU / any device without _C_ops:
-            # decode weights from CUDA tile layout to row-major for cpu_ops
+        if device_type == "cpu" and precision == "int4":
             decode_int4_state_dict_for_cpu(model_state_dict)
 
         patch_scale_key(transformer, model_state_dict)

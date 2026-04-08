@@ -7,7 +7,11 @@ except ImportError:
 
 from ..utils import ceil_divide
 from .cpu_ops import svdq_quantize_w4a4_act_fuse_lora_cpu
-from .xpu_ops import is_available as _xpu_kernels_available, svdq_quantize_w4a4_act_fuse_lora_xpu
+
+try:
+    from .xpu_ops import svdq_quantize_w4a4_act_fuse_lora_xpu as _xpu_quantize
+except ImportError:
+    _xpu_quantize = None
 
 
 def svdq_quantize_w4a4_act_fuse_lora_cuda(
@@ -47,8 +51,12 @@ def svdq_quantize_w4a4_act_fuse_lora_cuda(
             batch_size_pad, rank, dtype=torch.float32, device=input.device
         )
 
-    if input.device.type == "xpu" and _xpu_kernels_available():
-        svdq_quantize_w4a4_act_fuse_lora_xpu(
+    # Check if any tensor is on XPU (input may be CPU but weights on XPU)
+    _has_xpu = (input.device.type == "xpu" or
+                (smooth is not None and smooth.device.type == "xpu") or
+                (lora_down is not None and lora_down.device.type == "xpu"))
+    if _has_xpu and _xpu_quantize is not None:
+        _xpu_quantize(
             input, output, oscales, lora_down, lora_act_out, smooth, fuse_glu, fp4
         )
     elif input.device.type == "cpu" or _C_ops is None:

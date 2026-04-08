@@ -1,9 +1,11 @@
+import math
+
 import torch
 
 from ..utils import ceil_divide
 
 
-def un_pack_int4(packed: torch.Tensor, signed: bool = True) -> torch.Tensor:
+def unpack_int4(packed: torch.Tensor, signed: bool = True) -> torch.Tensor:
     p = packed.view(torch.uint8).to(torch.int16)
     low = p & 0x0F
     high = (p >> 4) & 0x0F
@@ -16,7 +18,7 @@ def un_pack_int4(packed: torch.Tensor, signed: bool = True) -> torch.Tensor:
     return unpacked.float()
 
 
-def _pack_int4(values: torch.Tensor) -> torch.Tensor:
+def pack_int4(values: torch.Tensor) -> torch.Tensor:
     K = values.shape[-1]
     assert K % 2 == 0
     v = values.to(torch.int16)
@@ -25,13 +27,13 @@ def _pack_int4(values: torch.Tensor) -> torch.Tensor:
     return (even | odd).to(torch.uint8)
 
 
-def _dequantize_w4a4(
+def dequantize_w4a4(
     packed: torch.Tensor,
     scales: torch.Tensor,
     group_size: int,
     signed: bool = True,
 ) -> torch.Tensor:
-    unpacked = un_pack_int4(packed, signed=signed)
+    unpacked = unpack_int4(packed, signed=signed)
     N, K = unpacked.shape
     num_groups = K // group_size
     unpacked = unpacked.view(N, num_groups, group_size)
@@ -39,7 +41,7 @@ def _dequantize_w4a4(
     return (unpacked * sc).view(N, K)
 
 
-def _svdq_groupwise_intdot_lowp_accum(
+def svdq_groupwise_intdot_lowp_accum(
     act_packed: torch.Tensor,
     act_scales: torch.Tensor,
     wgt_packed: torch.Tensor,
@@ -58,36 +60,26 @@ def _svdq_groupwise_intdot_lowp_accum(
         )
 
     group_size = group_size_act
-    act_i = un_pack_int4(act_packed, signed=not act_unsigned).to(torch.float32)
-    wgt_i = un_pack_int4(wgt_packed, signed=True).to(torch.float32)
+
+    act_i = unpack_int4(act_packed, signed=not act_unsigned).to(torch.float32)
+    wgt_i = unpack_int4(wgt_packed, signed=True).to(torch.float32)
 
     M, K = act_i.shape
     N = wgt_i.shape[0]
     num_groups = K // group_size
 
-    # Vectorized grouped dot product — no Python for-loop.
-    #
-    # Pre-scale each group's values by its per-group scale, then reshape back
-    # to [M, K] / [N, K] and do ONE large matmul.  This avoids materializing
-    # a [G, M, N] intermediate tensor (which would be huge for large M/N).
-    #
-    # Mathematically equivalent to:
-    #   result[m,n] = Σ_g ( Σ_k act[m,g,k]*wgt[n,g,k] ) * ascale[g,m]*wscale[g,n]
-    # Rewritten as:
-    #   result[m,n] = Σ_g Σ_k (act[m,g,k]*ascale[g,m]) * (wgt[n,g,k]*wscale[g,n])
-    #              = (scaled_act @ scaled_wgt.T)  where scaled_act = act * ascale
-    act_3d = act_i.view(M, num_groups, group_size)      # [M, G, gs]
-    wgt_3d = wgt_i.view(N, num_groups, group_size)      # [N, G, gs]
+    acc = torch.zeros(M, N, dtype=torch.float32, device=act_packed.device)
+    act_scales_f = act_scales.float()
+    wgt_scales_f = wgt_scales.float()
 
-    act_scales_f = act_scales.float()   # [G, M]
-    wgt_scales_f = wgt_scales.float()   # [G, N]
+    for g in range(num_groups):
+        k0 = g * group_size
+        k1 = (g + 1) * group_size
+        psum = act_i[:, k0:k1] @ wgt_i[:, k0:k1].T
+        scale = act_scales_f[g].view(-1, 1) * wgt_scales_f[g].view(1, -1)
+        acc = acc + psum * scale
 
-    # Pre-scale: broadcast [G, M, 1] * [M, G, gs] -> [M, G, gs]
-    scaled_act = act_3d * act_scales_f.T.unsqueeze(2)   # act_scales.T is [M, G]
-    scaled_wgt = wgt_3d * wgt_scales_f.T.unsqueeze(2)   # wgt_scales.T is [N, G]
-
-    # Single large matmul: [M, K] @ [K, N] -> [M, N]
-    result = scaled_act.reshape(M, K) @ scaled_wgt.reshape(N, K).T
+    result = acc
 
     if alpha != 1.0:
         result = result * float(alpha)
@@ -187,7 +179,7 @@ def svdq_quantize_w4a4_act_fuse_lora_cpu(
     x_q = torch.round(x_grouped * rscale.unsqueeze(-1))
     x_q = x_q.clamp(-8, 7).to(torch.int8).view(M, K)
 
-    packed = _pack_int4(x_q)
+    packed = pack_int4(x_q)
     output[:M].copy_(packed)
     if M_pad > M:
         output[M:].zero_()
@@ -238,7 +230,7 @@ def svdq_gemm_w4a4_cpu(
     if ascales is None or wscales is None:
         raise ValueError("ascales and wscales are required")
 
-    result = _svdq_groupwise_intdot_lowp_accum(
+    result = svdq_groupwise_intdot_lowp_accum(
         act_packed=act,
         act_scales=ascales,
         wgt_packed=wgt,
@@ -284,13 +276,16 @@ def _quantize_output_for_next_layer(
     M, N = result.shape
     M_pad = qout.shape[0]
     group_size = 64
+    shift_gelu = 0.171875
 
-    x = result.float()
+    x_gelu = torch.nn.functional.gelu(result.float(), approximate="tanh")
 
     if lora_down is not None and lora_act_out is not None:
-        lora_act_out[:M].copy_((x @ lora_down.float())[:M])
+        lora_act_out[:M].copy_((x_gelu @ lora_down.float())[:M])
         if M_pad > M:
             lora_act_out[M:].zero_()
+
+    x = x_gelu + shift_gelu
 
     if smooth_factor is not None:
         x = x / smooth_factor.float()
@@ -298,17 +293,16 @@ def _quantize_output_for_next_layer(
     num_groups = N // group_size
     x_grouped = x.view(M, num_groups, group_size)
     group_max = x_grouped.abs().amax(dim=-1)
-    scales = group_max / 7.0
-    scales = scales.clamp(min=1e-10)
-    rscale = 7.0 / group_max.clamp(min=1e-10)
+    scales = (group_max / 15.0).clamp(min=1e-10)
+    rscale = 15.0 / group_max.clamp(min=1e-10)
     x_q = (
         torch.round(x_grouped * rscale.unsqueeze(-1))
-        .clamp(-8, 7)
+        .clamp(0, 15)
         .to(torch.int8)
         .view(M, N)
     )
 
-    packed = _pack_int4(x_q)
+    packed = pack_int4(x_q)
     qout[:M].copy_(packed)
     if M_pad > M:
         qout[M:].zero_()
@@ -318,7 +312,7 @@ def _quantize_output_for_next_layer(
         oscales[:, M:].zero_()
 
 
-def _svdq_quantize_linear_int4_cpu(
+def svdq_quantize_linear_int4_cpu(
     input: torch.Tensor,
     smooth: torch.Tensor | None = None,
     group_size: int = 64,
@@ -349,11 +343,11 @@ def _svdq_quantize_linear_int4_cpu(
         .to(torch.int8)
         .view(M_pad, K)
     )
-    packed = _pack_int4(x_q)
+    packed = pack_int4(x_q)
     return packed, scales.T.contiguous()
 
 
-def _svdq_quantize_and_downproj_linear_int4_cpu(
+def svdq_quantize_and_downproj_linear_int4_cpu(
     input: torch.Tensor,
     smooth: torch.Tensor | None = None,
     lora_down: torch.Tensor | None = None,
@@ -366,7 +360,7 @@ def _svdq_quantize_and_downproj_linear_int4_cpu(
     if lora_down is not None:
         lora_act_out = x_raw @ lora_down.float()
 
-    packed, scales = _svdq_quantize_linear_int4_cpu(
+    packed, scales = svdq_quantize_linear_int4_cpu(
         input=input,
         smooth=smooth,
         group_size=group_size,
@@ -388,7 +382,7 @@ def _svdq_quantize_and_downproj_linear_int4_cpu(
     return packed, scales, lora_act_out
 
 
-def _svdq_dequant_gemm_a16_cpu(
+def svdq_dequant_gemm_a16_cpu(
     act_packed: torch.Tensor,
     act_scales: torch.Tensor,
     wgt_packed: torch.Tensor,
@@ -399,7 +393,7 @@ def _svdq_dequant_gemm_a16_cpu(
     bias: torch.Tensor | None = None,
     out_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    return _svdq_groupwise_intdot_lowp_accum(
+    return svdq_groupwise_intdot_lowp_accum(
         act_packed=act_packed,
         act_scales=act_scales,
         wgt_packed=wgt_packed,
@@ -412,7 +406,7 @@ def _svdq_dequant_gemm_a16_cpu(
     )
 
 
-def _svdq_fused_w4a4_a16_linear_cpu(
+def svdq_fused_w4a4_a16_linear_cpu(
     input_fp: torch.Tensor,
     wgt_packed: torch.Tensor,
     wgt_scales: torch.Tensor,
@@ -427,7 +421,7 @@ def _svdq_fused_w4a4_a16_linear_cpu(
     pad_to: int | None = None,
     out_dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, dict]:
-    qact, ascales, lora_act = _svdq_quantize_and_downproj_linear_int4_cpu(
+    qact, ascales, lora_act = svdq_quantize_and_downproj_linear_int4_cpu(
         input=input_fp,
         smooth=smooth_factor,
         lora_down=lora_down,
@@ -435,7 +429,7 @@ def _svdq_fused_w4a4_a16_linear_cpu(
         pad_to=pad_to,
     )
 
-    out_main = _svdq_dequant_gemm_a16_cpu(
+    out_main = svdq_dequant_gemm_a16_cpu(
         act_packed=qact,
         act_scales=ascales,
         wgt_packed=wgt_packed,
@@ -469,7 +463,7 @@ def _svdq_fused_w4a4_a16_linear_cpu(
     }
 
 
-def _svdq_verify_dequant_gemm_a16_cpu(
+def svdq_verify_dequant_gemm_a16_cpu(
     act_fp: torch.Tensor,
     wgt_fp: torch.Tensor,
     act_smooth: torch.Tensor | None = None,
@@ -482,20 +476,20 @@ def _svdq_verify_dequant_gemm_a16_cpu(
     if act_fp.shape[1] != wgt_fp.shape[1]:
         raise ValueError("act_fp.shape[1] must equal wgt_fp.shape[1]")
 
-    act_q, act_scales = _svdq_quantize_linear_int4_cpu(
+    act_q, act_scales = svdq_quantize_linear_int4_cpu(
         act_fp,
         smooth=act_smooth,
         group_size=act_group_size,
         pad_to=act_pad_to,
     )
-    wgt_q, wgt_scales = _svdq_quantize_linear_int4_cpu(
+    wgt_q, wgt_scales = svdq_quantize_linear_int4_cpu(
         wgt_fp,
         smooth=None,
         group_size=wgt_group_size,
         pad_to=None,
     )
 
-    pred = _svdq_dequant_gemm_a16_cpu(
+    pred = svdq_dequant_gemm_a16_cpu(
         act_q,
         act_scales,
         wgt_q,
@@ -538,26 +532,26 @@ def _svdq_verify_dequant_gemm_a16_cpu(
 
 
 def awq_unpack_weights(kernel: torch.Tensor, n: int, k: int) -> torch.Tensor:
-    qw = kernel.reshape(n, k // 8).to(torch.int64)
-
-    num_groups_32 = k // 32
-
-    qw = qw.reshape(n, num_groups_32, 4)
-
-    shifts = torch.tensor(
-        [0, 4, 8, 12, 16, 20, 24, 28], dtype=torch.int64, device=qw.device
+    packed16 = kernel.view(torch.int16).reshape(n // 4, k)
+    packed = (
+        packed16.reshape(n // 4, k // 64, 4, 16)
+        .permute(0, 2, 1, 3)
+        .reshape(n, k // 32, 8)
+        .to(torch.int32)
     )
-    nibbles = (qw.unsqueeze(-1) >> shifts) & 0xF
 
-    u_idx = torch.arange(4, device=qw.device)
-    n_idx = torch.arange(8, device=qw.device)
-    ic_offsets = 2 * u_idx.unsqueeze(-1) + (n_idx // 2) * 8 + (n_idx % 2)
-
-    weight = torch.zeros(
-        n, num_groups_32, 32, dtype=torch.float32, device=kernel.device
+    masks = torch.tensor(
+        [0xF, 0xF0, 0xF00, 0xF000], dtype=torch.int32, device=packed.device
     )
-    flat_offsets = ic_offsets.reshape(1, 1, 32).expand(n, num_groups_32, 32)
-    weight.scatter_(2, flat_offsets, nibbles.reshape(n, num_groups_32, 32).float())
+    shifts = torch.tensor([0, 4, 8, 12], dtype=torch.int32, device=packed.device)
+    parts = ((packed.unsqueeze(-1) & masks) >> shifts).to(torch.float32)
+
+    weight = torch.zeros(n, k // 32, 32, dtype=torch.float32, device=packed.device)
+    for idx in range(8):
+        weight[:, :, idx] = parts[:, :, idx, 0]
+        weight[:, :, idx + 8] = parts[:, :, idx, 1]
+        weight[:, :, idx + 16] = parts[:, :, idx, 2]
+        weight[:, :, idx + 24] = parts[:, :, idx, 3]
 
     return weight.reshape(n, k)
 

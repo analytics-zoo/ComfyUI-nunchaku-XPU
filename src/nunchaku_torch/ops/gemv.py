@@ -6,7 +6,11 @@ except ImportError:
     _C_ops = None
 
 from .cpu_ops import awq_gemv_w4a16_cpu
-from .xpu_ops import is_available as _xpu_kernels_available, awq_gemv_w4a16_xpu
+
+try:
+    from .xpu_ops import awq_gemv_w4a16_xpu as _xpu_gemv
+except ImportError:
+    _xpu_gemv = None
 
 
 def awq_gemv_w4a16_cuda(
@@ -19,8 +23,8 @@ def awq_gemv_w4a16_cuda(
     k: int,
     group_size: int = 64,
 ) -> torch.Tensor:
-    if in_feats.device.type == "xpu" and _xpu_kernels_available():
-        return awq_gemv_w4a16_xpu(
+    if in_feats.device.type == "xpu" and _xpu_gemv is not None:
+        return _xpu_gemv(
             in_feats, kernel, scaling_factors, zeros, m, n, k, group_size
         )
     if in_feats.device.type == "cpu" or _C_ops is None:
