@@ -100,14 +100,14 @@ def get_precision(
     if isinstance(device, str):
         device = torch.device(device)
     if precision == "auto":
-        if device.type != "cuda":
-            precision = "int4"
-        else:
+        if device.type == "cuda":
             capability = torch.cuda.get_device_capability(
                 0 if device.index is None else device.index
             )
             sm = f"{capability[0]}{capability[1]}"
             precision = "fp4" if sm in ["120", "121"] else "int4"
+        else:
+            precision = "int4"
     if pretrained_model_name_or_path is not None:
         if precision == "int4":
             if "fp4" in str(pretrained_model_name_or_path):
@@ -125,6 +125,8 @@ def get_precision(
 def is_turing(device: str | torch.device = "cuda") -> bool:
     if isinstance(device, str):
         device = torch.device(device)
+    if device.type != "cuda":
+        return False
     device_id = 0 if device.index is None else device.index
     capability = torch.cuda.get_device_capability(device_id)
     sm = f"{capability[0]}{capability[1]}"
@@ -135,7 +137,10 @@ def get_gpu_memory(device: str | torch.device = "cuda", unit: str = "GiB") -> in
     if isinstance(device, str):
         device = torch.device(device)
     assert unit in ("GiB", "MiB", "B")
-    memory = torch.cuda.get_device_properties(device).total_memory
+    if device.type == "xpu":
+        memory = torch.xpu.get_device_properties(device).total_memory
+    else:
+        memory = torch.cuda.get_device_properties(device).total_memory
     if unit == "GiB":
         return memory // (1024**3)
     elif unit == "MiB":
@@ -149,6 +154,10 @@ def check_hardware_compatibility(
 ):
     if isinstance(device, str):
         device = torch.device(device)
+    if device.type == "xpu":
+        return  # XPU supports int4
+    if device.type == "cpu":
+        return
     capability = torch.cuda.get_device_capability(
         0 if device.index is None else device.index
     )
