@@ -6,6 +6,7 @@ from ..ops.gemv import awq_gemv_w4a16_cuda
 from ..ops.quantize import svdq_quantize_w4a4_act_fuse_lora_cuda
 
 
+
 class SVDQW4A4Linear(nn.Module):
     def __init__(
         self,
@@ -107,8 +108,7 @@ class SVDQW4A4Linear(nn.Module):
         batch_size, seq_len, channels = x.shape
         x = x.reshape(batch_size * seq_len, channels)
 
-        # XPU: always use direct W4A16 GEMM (skip activation quantization)
-        # This gives better precision than quantize→dequant→GEMM
+        # XPU: direct W4A16 GEMM (skip activation quantization for speed)
         if self.qweight.device.type == "xpu":
             result = self._forward_xpu(x)
             return result.reshape(batch_size, seq_len, -1)
@@ -123,11 +123,11 @@ class SVDQW4A4Linear(nn.Module):
         return output
 
     def _forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
-        """Direct W4A16 GEMM on XPU — no activation quantization.
+        """Direct W4A16 GEMM on XPU via oneDNN.
 
-        Applies smooth factor, then uses oneDNN INT4 GEMM with bf16 activations.
-        Avoids the lossy quantize→dequantize round-trip.
-        Handles CPU input with XPU weights transparently.
+        Applies smooth factor (fused ESIMD kernel → fp16), then INT4 weight GEMM.
+        nan_to_num_ handles rare fp16 overflow in layers with extreme smooth factors
+        (e.g. noise_refiner.1.feed_forward.w2: ~0.4% of elements).
         """
         try:
             from omni_xpu_kernel import svdq as omni_svdq
@@ -139,17 +139,16 @@ class SVDQW4A4Linear(nn.Module):
         x_orig_dtype = x.dtype
         xpu_device = self.qweight.device
 
-        # Move input to XPU if needed
         if x.device != xpu_device:
             x = x.to(xpu_device)
 
-        # Apply smooth factor (rcp_smooth cached)
-        # fused_smooth_mul_convert outputs f16; keep as f16 to avoid extra bf16 conversion
+        # Apply smooth factor: fused ESIMD kernel (fp16 output, zero extra allocation).
+        # nan_to_num_ replaces rare inf from fp16 overflow in-place.
         if self.smooth_factor is not None:
             if not hasattr(self, '_xpu_rcp_smooth') or self._xpu_rcp_smooth is None:
                 self._xpu_rcp_smooth = (1.0 / self.smooth_factor.float()).to(torch.float16)
             x_gemm = omni_svdq.fused_smooth_mul_convert(x, self._xpu_rcp_smooth)
-            # x_gemm is f16 — oneDNN accepts both f16 and bf16
+            x_gemm.nan_to_num_(nan=0.0, posinf=65504.0, neginf=-65504.0)
         else:
             x_gemm = x.to(torch.float16)
 
@@ -160,31 +159,26 @@ class SVDQW4A4Linear(nn.Module):
                 wgt_u8, self.wscales
             )
 
-        # W4A16 GEMM with fused LoRA+bias via onednn_int4_gemm_add_to_output
+        # W4A16 GEMM with fused LoRA+bias
         has_lora = self.proj_down is not None and self.proj_up is not None
         if has_lora or self.bias is not None:
-            # Pre-fill dst with LoRA residual + bias
-            M = x_gemm.shape[0]
-            N = self.out_features
+            M, N = x_gemm.shape[0], self.out_features
             dst = torch.zeros(M, N, dtype=torch.bfloat16, device=x_gemm.device)
             if has_lora:
-                lora_act = x.float() @ self.proj_down.float()
-                lora_out = lora_act @ self.proj_up.float().T
-                dst += lora_out.to(torch.bfloat16)
+                lora_out = (x.float() @ self.proj_down.float()) @ self.proj_up.float().T
+                dst.add_(lora_out.to(torch.bfloat16))
+                del lora_out
             if self.bias is not None:
-                dst += self.bias.to(torch.bfloat16)
-            # Fused: dst += GEMM(f16_act, u4_wgt)
+                dst.add_(self.bias.to(torch.bfloat16))
             omni_svdq.onednn_int4_gemm_add_to_output(
-                x_gemm.to(torch.float16), self._xpu_packed_u4, self._xpu_scales_f16, dst
+                x_gemm, self._xpu_packed_u4, self._xpu_scales_f16, dst
             )
             result = dst
         else:
-            # No LoRA/bias: plain GEMM
             result = omni_svdq.onednn_int4_gemm_preconverted(
                 x_gemm, self._xpu_packed_u4, self._xpu_scales_f16
             )
 
-        # Convert to output dtype and move back to input device
         return result.to(x_orig_dtype).to(input_device)
 
     def quantize(

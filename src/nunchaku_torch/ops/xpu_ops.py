@@ -71,14 +71,13 @@ def svdq_quantize_w4a4_act_fuse_lora_xpu(
         if M_pad > M:
             lora_act_out[M:].zero_()
 
-    # Step 2: Apply smoothing and convert to bf16
+    # Step 2: Apply smoothing in fp32 — use division (not multiply-by-reciprocal)
+    # to match CPU reference exactly. IEEE 754: a/b != a*(1/b) due to intermediate rounding.
     if smooth is not None:
-        smooth_dev = smooth.to(compute_device)
-        rcp_smooth = (1.0 / smooth_dev.float()).to(torch.float16)
-        x_smooth = omni.svdq.fused_smooth_mul_convert(inp, rcp_smooth)
-        x_smooth = x_smooth.to(torch.bfloat16)
+        smooth_dev = smooth.to(compute_device).float()
+        x_smooth = inp.float() / smooth_dev
     else:
-        x_smooth = inp.to(torch.bfloat16)
+        x_smooth = inp.float()
 
     # Step 3: Pad to M_pad
     if M_pad > M:
@@ -184,15 +183,31 @@ def svdq_gemm_w4a4_xpu(
     ascales_dev = ascales.to(compute_device) if ascales.device != compute_device else ascales
     wscales_dev = wscales.to(compute_device) if wscales.device != compute_device else wscales
 
-    # Get pre-converted oneDNN weights
-    packed_u4, scales_f16 = _get_prepared_weights(wgt_dev, wscales_dev)
+    # True W4A4 GEMM: unpack INT4 → group-wise INT8×INT8→INT32 matmul → fp32 scale.
+    # Uses torch._int_mm for exact integer accumulation (matches CUDA's INT4×INT4→INT32).
+    # Iterates over groups to minimize memory.
+    K = act_dev.shape[1] * 2  # packed INT4: K/2 bytes
+    group_size = K // ascales_dev.shape[0]
+    num_groups = K // group_size
 
-    # Step 1: Dequantize activations from INT4 to bf16
-    act_u8 = act_dev.view(torch.uint8)
-    act_bf16 = omni.svdq.dequantize_w4(act_u8, ascales_dev, torch.bfloat16)
+    # Unpack INT4 to int8 (2 values per byte → individual int8 values)
+    act_i8 = omni.svdq.unpack_int4(act_dev.view(torch.uint8), not act_unsigned)  # [M, K] int8
+    wgt_i8 = omni.svdq.unpack_int4(wgt_dev.view(torch.uint8), True)  # [N, K] int8
 
-    # Step 2: Main W4 GEMM via oneDNN
-    result = omni.svdq.onednn_int4_gemm_preconverted(act_bf16, packed_u4, scales_f16)
+    ascales_f = ascales_dev.to(torch.float32)  # [groups, M]
+    wscales_f = wscales_dev.to(torch.float32)  # [groups, N]
+
+    # Group-wise INT32 accumulation — exact integer arithmetic like CUDA
+    acc = torch.zeros(M, N, dtype=torch.float32, device=compute_device)
+    for g in range(num_groups):
+        k0, k1 = g * group_size, (g + 1) * group_size
+        # INT8×INT8→INT32 matmul (exact, no rounding)
+        psum = torch._int_mm(act_i8[:, k0:k1], wgt_i8[:, k0:k1].T)  # [M, N] int32
+        # Apply per-group scales in fp32
+        scaled = psum.float() * ascales_f[g].unsqueeze(1) * wscales_f[g].unsqueeze(0)
+        acc += scaled
+    result = acc.to(torch.bfloat16)
+    del act_i8, wgt_i8, acc
 
     # Step 3: Apply alpha scaling
     if alpha != 1.0:
@@ -298,11 +313,12 @@ def _quantize_output_for_next_layer_xpu(
     # Add shift for unsigned quantization
     x = x_gelu + shift_gelu
 
-    # Apply smooth factor for next layer
+    # Apply smooth factor for next layer (bf16 to avoid fp16 overflow, nan_to_num for inf)
     if smooth_factor is not None:
         sf = smooth_factor.to(compute_device) if smooth_factor.device != compute_device else smooth_factor
-        rcp_smooth = (1.0 / sf.float()).to(torch.float16)
-        x_f16 = omni.svdq.fused_smooth_mul_convert(x.to(torch.bfloat16), rcp_smooth)
+        rcp_smooth = (1.0 / sf.float()).to(torch.bfloat16)
+        x_f16 = (x.to(torch.bfloat16) * rcp_smooth).to(torch.float16)
+        x_f16.nan_to_num_(nan=0.0, posinf=65504.0, neginf=-65504.0)
     else:
         x_f16 = x.to(torch.float16)
 
