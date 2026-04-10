@@ -44,5 +44,5 @@ elapsed = time.time() - t0
 
 s = out.sample[0] if isinstance(out.sample, list) else out.sample
 print(f"  Output: {s.shape}, nan={torch.isnan(s).any()}, range=[{s.min():.2f},{s.max():.2f}]")
-print(f"  Time: {elapsed*1000:.1f}ms (was ~665ms with offload)")
+print(f"  Time: {elapsed*1000:.1f}ms")
 print(f"  XPU mem: {torch.xpu.memory_allocated()/1e9:.2f} GB")

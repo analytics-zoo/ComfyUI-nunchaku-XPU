@@ -9,13 +9,6 @@ Standalone PyTorch runtime for Nunchaku SVDQuant W4A4 inference on CPU, XPU, and
 - SVDQuant W4A4 quantized model inference with LoRA support
 - Currently validated models: ZImage (Z-Image-Turbo), QwenImage
 
-### Performance (Intel XPU, 1024x1024, 9 steps)
-
-| Configuration | Time |
-|---|---|
-| Original unquantized model | ~10s |
-| nunchaku-torch (SVDQuant W4A4) | ~12.35s |
-
 ## Install
 
 ```bash
