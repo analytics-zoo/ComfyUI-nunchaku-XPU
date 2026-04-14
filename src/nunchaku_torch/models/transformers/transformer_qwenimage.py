@@ -306,6 +306,8 @@ class NunchakuQwenImageTransformer2DModel(
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+            elif hasattr(torch, "xpu") and torch.xpu.is_available():
+                torch.xpu.empty_cache()
 
     def forward(
         self,
@@ -321,7 +323,7 @@ class NunchakuQwenImageTransformer2DModel(
         return_dict: bool = True,
     ) -> Union[torch.Tensor, Transformer2DModelOutput]:
         device = hidden_states.device
-        use_cuda_streams = device.type == "cuda"
+        use_streams = device.type in ("cuda", "xpu")
         if self.offload:
             self.offload_manager.set_device(device)
 
@@ -343,14 +345,15 @@ class NunchakuQwenImageTransformer2DModel(
             img_shapes, txt_seq_lens, device=hidden_states.device
         )
 
-        if use_cuda_streams:
-            compute_stream = torch.cuda.current_stream()
+        if use_streams:
+            from ..utils import _current_stream, _stream_context
+            compute_stream = _current_stream(device)
             if self.offload:
                 self.offload_manager.initialize(compute_stream)
 
         for block_idx, block in enumerate(self.transformer_blocks):
-            if use_cuda_streams:
-                with torch.cuda.stream(compute_stream):
+            if use_streams:
+                with _stream_context(compute_stream):
                     if self.offload:
                         block = self.offload_manager.get_block(block_idx)
                     encoder_hidden_states, hidden_states = self._run_block(

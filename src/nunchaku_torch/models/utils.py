@@ -6,6 +6,44 @@ from torch import nn
 from ..utils import copy_params_into
 
 
+def _device_event(device, **kwargs):
+    """Create a device Event (CUDA or XPU)."""
+    if device.type == "xpu":
+        # torch.xpu.Event doesn't support 'blocking' kwarg
+        kwargs.pop("blocking", None)
+        return torch.xpu.Event(**kwargs)
+    return torch.cuda.Event(**kwargs)
+
+
+def _device_stream(device):
+    """Create a device Stream (CUDA or XPU)."""
+    if device.type == "xpu":
+        return torch.xpu.Stream(device=device)
+    return torch.cuda.Stream(device=device)
+
+
+def _current_stream(device):
+    """Get current stream for device."""
+    if device.type == "xpu":
+        return torch.xpu.current_stream(device)
+    return torch.cuda.current_stream(device)
+
+
+def _stream_context(stream):
+    """Context manager for stream (works for both CUDA and XPU)."""
+    if hasattr(torch.xpu, "stream") and isinstance(stream, torch.xpu.Stream):
+        return torch.xpu.stream(stream)
+    return torch.cuda.stream(stream)
+
+
+def _empty_cache(device):
+    """Empty cache for device."""
+    if device.type == "xpu":
+        torch.xpu.empty_cache()
+    elif device.type == "cuda":
+        torch.cuda.empty_cache()
+
+
 def fuse_linears(linears: list[nn.Linear]) -> nn.Linear:
     assert len(linears) > 0
     if len(linears) == 1:
@@ -40,9 +78,11 @@ class CPUOffloadManager:
         assert self.num_blocks_on_gpu > 0
 
         self.memory_stream = None
+        self._device_obj = None  # set in set_device
 
-        self.compute_done = torch.cuda.Event(blocking=False)
-        self.memory_done = torch.cuda.Event(blocking=False)
+        # Events created lazily in set_device once we know the device type
+        self.compute_done = None
+        self.memory_done = None
 
         self.buffer_blocks = [copy.deepcopy(blocks[0]), copy.deepcopy(blocks[0])]
 
@@ -56,11 +96,14 @@ class CPUOffloadManager:
     def set_device(self, device: torch.device | str, force: bool = False):
         if isinstance(device, str):
             device = torch.device(device)
-        assert device.type == "cuda"
+        assert device.type in ("cuda", "xpu")
         if self.device == device and not force:
             return
         self.device = device
-        self.memory_stream = torch.cuda.Stream(device=device)
+        self._device_obj = device
+        self.memory_stream = _device_stream(device)
+        self.compute_done = _device_event(device, blocking=False)
+        self.memory_done = _device_event(device, blocking=False)
         for block in self.buffer_blocks:
             block.to(device)
         for module in self.on_gpu_modules:
@@ -87,15 +130,15 @@ class CPUOffloadManager:
             block, self.buffer_blocks[block_idx % 2], non_blocking=non_blocking
         )
 
-    def step(self, compute_stream: torch.cuda.Stream | None = None):
+    def step(self, compute_stream=None):
         if compute_stream is None:
-            compute_stream = torch.cuda.current_stream()
-        next_compute_done = torch.cuda.Event()
+            compute_stream = _current_stream(self.device)
+        next_compute_done = _device_event(self.device)
         next_compute_done.record(compute_stream)
-        with torch.cuda.stream(self.memory_stream):
+        with _stream_context(self.memory_stream):
             self.memory_stream.wait_event(self.compute_done)
             self.load_block(self.current_block_idx + 1)
-            next_memory_done = torch.cuda.Event()
+            next_memory_done = _device_event(self.device)
             next_memory_done.record(self.memory_stream)
         self.memory_done = next_memory_done
         self.compute_done = next_compute_done
@@ -110,7 +153,7 @@ class CPUOffloadManager:
                 self.empty_cache_freq > 0
                 and self.forward_counter % self.empty_cache_freq == 0
             ):
-                torch.cuda.empty_cache()
+                _empty_cache(self.device)
 
     def get_block(self, block_idx: int | None = None) -> nn.Module:
         if block_idx is None:
@@ -120,8 +163,8 @@ class CPUOffloadManager:
         else:
             return self.buffer_blocks[block_idx % 2]
 
-    def initialize(self, stream: torch.cuda.Stream | None = None):
+    def initialize(self, stream=None):
         if stream is None:
-            stream = torch.cuda.current_stream()
+            stream = _current_stream(self.device)
         self.compute_done.record(stream)
         self.memory_done.record(stream)
