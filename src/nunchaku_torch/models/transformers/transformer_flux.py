@@ -17,7 +17,7 @@ from huggingface_hub import utils
 from ...ops.gemm import _C_ops as _GEMM_C_OPS
 from ...ops.gemv import _C_ops as _GEMV_C_OPS
 from ...ops.quantize import _C_ops as _QUANT_C_OPS
-from ...utils import get_precision
+from ...utils import get_precision, load_state_dict_in_safetensors
 from ...ops.fused import fused_gelu_mlp
 from ..attention import NunchakuBaseAttention, NunchakuFeedForward
 from ..attention_processors.flux import (
@@ -440,18 +440,40 @@ class NunchakuFluxTransformer2DModel(FluxTransformer2DModel, NunchakuModelLoader
         device = kwargs.get("device", "cpu")
         torch_dtype = kwargs.get("torch_dtype", torch.bfloat16)
         cpu_kernel_layout = kwargs.pop("cpu_kernel_layout", True)
+        return_metadata = kwargs.pop("return_metadata", False)
 
         if isinstance(pretrained_model_name_or_path, str):
             pretrained_model_name_or_path = Path(pretrained_model_name_or_path)
 
-        assert (
+        # Support both single-file (with embedded config) and directory (legacy) formats
+        is_single_file = (
             pretrained_model_name_or_path.is_file()
             or pretrained_model_name_or_path.name.endswith((".safetensors", ".sft"))
-        ), "Only safetensors are supported"
-
-        transformer, model_state_dict, metadata = cls._build_model(
-            pretrained_model_name_or_path, **kwargs
         )
+
+        if is_single_file:
+            try:
+                transformer, model_state_dict, metadata = cls._build_model(
+                    pretrained_model_name_or_path, **kwargs
+                )
+            except (TypeError, KeyError):
+                # Fallback: file exists but has no embedded config (directory-format model)
+                is_single_file = False
+
+        if not is_single_file:
+            # Directory format: transformer_blocks.safetensors + unquantized_layers.safetensors + config.json
+            model_dir = pretrained_model_name_or_path
+            if pretrained_model_name_or_path.is_file():
+                model_dir = pretrained_model_name_or_path.parent
+            transformer, unquant_path, blocks_path = cls._build_model_legacy(
+                model_dir, **kwargs
+            )
+            # Load and merge state dicts
+            model_state_dict = {}
+            for p in [unquant_path, blocks_path]:
+                sd = load_state_dict_in_safetensors(Path(p))
+                model_state_dict.update(sd)
+            metadata = {}
         quantization_config = json.loads(metadata.get("quantization_config", "{}"))
         rank = quantization_config.get("rank", 32)
         transformer = transformer.to(torch_dtype)
@@ -495,6 +517,8 @@ class NunchakuFluxTransformer2DModel(FluxTransformer2DModel, NunchakuModelLoader
             logger.warning(f"Missing keys: {result.missing_keys[:10]}...")
         if result.unexpected_keys:
             logger.warning(f"Unexpected keys: {result.unexpected_keys[:10]}...")
+        if return_metadata:
+            return transformer, metadata
         return transformer
 
     def forward(

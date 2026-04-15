@@ -191,7 +191,11 @@ def svdq_gemm_w4a4_xpu(
     num_groups = K // group_size
 
     # Unpack INT4 to int8 (2 values per byte → individual int8 values)
-    act_i8 = omni.svdq.unpack_int4(act_dev.view(torch.uint8), not act_unsigned)  # [M, K] int8
+    # omni unpack_int4 only supports signed; for unsigned, unpack as signed then add 8
+    act_i8 = omni.svdq.unpack_int4(act_dev.view(torch.uint8), True)  # always unpack as signed
+    if act_unsigned:
+        act_i8 = act_i8.to(torch.int16) + 8  # unsigned INT4: [0, 15] = signed [-8, 7] + 8
+        act_i8 = act_i8.to(torch.int8)
     wgt_i8 = omni.svdq.unpack_int4(wgt_dev.view(torch.uint8), True)  # [N, K] int8
 
     ascales_f = ascales_dev.to(torch.float32)  # [groups, M]
