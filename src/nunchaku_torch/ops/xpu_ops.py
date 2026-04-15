@@ -333,11 +333,29 @@ def _quantize_output_for_next_layer_xpu(
     else:
         x_padded = x_f16.contiguous()
 
-    # Quantize to unsigned INT4
-    packed_act, ascales = omni.svdq.quantize_act_int4(x_padded, group_size=64)
+    # Quantize to unsigned INT4 [0, 15] for fc2's act_unsigned path.
+    # omni quantize_act_int4 always produces signed [-8, 7]. We quantize as signed
+    # and the GEMM unpack adds +8 to recover unsigned values. This is mathematically
+    # equivalent: stored_signed = value_unsigned - 8, and GEMM does +8 to recover.
+    # But the scale must be computed for unsigned range [0, 15] not signed [-8, 7].
+    # Since input is GELU+shift (all non-negative), signed quantize uses only [0, 7]
+    # wasting half the range. Instead: compute unsigned scale, quantize, then store
+    # as signed (subtract 8) so GEMM's +8 recovers the correct unsigned value.
+    gs = 64
+    x_grouped = x_padded.float().reshape(M_pad, N // gs, gs)
+    # Unsigned scale: max / 15 (input is non-negative after GELU+shift)
+    group_max = x_grouped.amax(dim=-1).clamp(min=1e-10)  # [M_pad, N//gs]
+    uscale = group_max / 15.0
+    # Quantize to unsigned [0, 15] then shift to signed [-8, 7] for storage
+    x_quant = (x_grouped / uscale.unsqueeze(-1)).round().clamp(0, 15).to(torch.int8) - 8
+    # Pack signed INT4 pairs into uint8
+    x_flat = x_quant.reshape(M_pad, N)
+    low = x_flat[:, 0::2].to(torch.uint8) & 0x0F
+    high = (x_flat[:, 1::2].to(torch.uint8) & 0x0F) << 4
+    packed = (low | high).to(torch.uint8)
 
-    qout.copy_(packed_act.to(qout.device).view(qout.dtype))
-    oscales.copy_(ascales.to(oscales.dtype).to(oscales.device))
+    qout.copy_(packed.to(qout.device).view(qout.dtype))
+    oscales.copy_(uscale.T.to(oscales.dtype).to(oscales.device))
 
 
 # ============================================================================
