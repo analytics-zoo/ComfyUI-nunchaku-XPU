@@ -66,7 +66,7 @@ def svdq_quantize_w4a4_act_fuse_lora_xpu(
 
     # Step 1: LoRA down projection (on original input, before smoothing)
     if lora_down is not None and lora_act_out is not None:
-        lora_result = inp.float() @ lora_down.to(compute_device).float()
+        lora_result = inp.to(torch.bfloat16) @ lora_down.to(compute_device).to(torch.bfloat16)
         lora_act_out[:M].copy_(lora_result.to(lora_act_out.dtype).to(lora_act_out.device))
         if M_pad > M:
             lora_act_out[M:].zero_()
@@ -255,13 +255,13 @@ def _compute_lora_residual_xpu(
     lora_act_in, lora_up, bias, lora_mode,
     lora_up_effective, bias_effective, lora_scales,
 ):
-    """Compute LoRA residual: lora_act @ lora_up.T + bias."""
-    lora_act = lora_act_in.float()
+    """Compute LoRA residual: lora_act @ lora_up.T + bias. Uses bf16 to avoid fp32 overhead."""
+    lora_act = lora_act_in.to(torch.bfloat16)
 
     # Apply per-group lora_scales
     if lora_scales is not None and len(lora_scales) > 0:
         rank = lora_act.shape[1]
-        scale_t = torch.ones(rank, dtype=torch.float32, device=lora_act.device)
+        scale_t = torch.ones(rank, dtype=torch.bfloat16, device=lora_act.device)
         for g, s in enumerate(lora_scales):
             start = g * 16
             end = min(start + 16, rank)
@@ -273,17 +273,17 @@ def _compute_lora_residual_xpu(
     if lora_mode == "naive":
         if lora_up is None:
             raise ValueError("lora_up is required for lora_mode='naive'")
-        residual = lora_act @ lora_up.float().T
+        residual = lora_act @ lora_up.to(torch.bfloat16).T
         if bias is not None:
-            residual = residual + bias.float().view(1, -1)
+            residual = residual + bias.to(torch.bfloat16).view(1, -1)
         return residual
 
     if lora_mode == "effective_linear":
         if lora_up_effective is None:
             raise ValueError("lora_up_effective required for effective_linear mode")
-        residual = lora_act @ lora_up_effective.float()
+        residual = lora_act @ lora_up_effective.to(torch.bfloat16)
         if bias_effective is not None:
-            residual = residual + bias_effective.float().view(1, -1)
+            residual = residual + bias_effective.to(torch.bfloat16).view(1, -1)
         return residual
 
     raise ValueError(f"Unsupported lora_mode: {lora_mode}")

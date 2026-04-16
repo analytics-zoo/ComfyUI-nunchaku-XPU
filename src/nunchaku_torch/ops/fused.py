@@ -101,7 +101,7 @@ def _fused_gelu_mlp_xpu(
     # LoRA down for fc2 must use GELU output (before smooth)
     has_lora = fc2.proj_down is not None and fc2.proj_up is not None
     if has_lora:
-        lora_out = (fc1_out.float() @ fc2.proj_down.float()) @ fc2.proj_up.float().T
+        lora_out = (fc1_out.to(torch.bfloat16) @ fc2.proj_down.to(torch.bfloat16)) @ fc2.proj_up.to(torch.bfloat16).T
 
     if fc2.smooth_factor is not None:
         if not hasattr(fc2, '_xpu_rcp_smooth') or fc2._xpu_rcp_smooth is None:

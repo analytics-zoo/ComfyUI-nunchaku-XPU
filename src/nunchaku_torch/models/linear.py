@@ -180,8 +180,8 @@ class SVDQW4A4Linear(nn.Module):
             M, N = x_gemm.shape[0], self.out_features
             dst = torch.zeros(M, N, dtype=torch.bfloat16, device=x_gemm.device)
             if has_lora:
-                lora_out = (x.float() @ self.proj_down.float()) @ self.proj_up.float().T
-                dst.add_(lora_out.to(torch.bfloat16))
+                lora_out = (x.to(torch.bfloat16) @ self.proj_down.to(torch.bfloat16)) @ self.proj_up.to(torch.bfloat16).T
+                dst.add_(lora_out)
                 del lora_out
             if self.bias is not None:
                 dst.add_(self.bias.to(torch.bfloat16))
