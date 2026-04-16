@@ -183,33 +183,31 @@ def svdq_gemm_w4a4_xpu(
     ascales_dev = ascales.to(compute_device) if ascales.device != compute_device else ascales
     wscales_dev = wscales.to(compute_device) if wscales.device != compute_device else wscales
 
-    # W4A4 GEMM: ESIMD dequant + oneDNN bf16 GEMM.
-    # Uses existing dequantize_w4 ESIMD kernel (fused unpack+scale, 0.2ms) for activations,
-    # then oneDNN INT4 GEMM (1ms) for the matmul. Total ~1.2ms vs 11.6ms for fp32 matmul.
-    K = act_dev.shape[1] * 2  # packed INT4: K/2 bytes
+    # W4A4 GEMM: unpack INT4 → fp32 dequant → fp32 matmul.
+    # Uses fp32 throughout to match CPU W4A4 reference precision exactly.
+    # bf16 dequant + oneDNN GEMM has ~0.1% per-layer rounding error that accumulates
+    # to visible artifacts (color banding) on certain seeds over 30 layers × 9 steps.
+    K = act_dev.shape[1] * 2
+    group_size = K // ascales_dev.shape[0]
+    num_groups = K // group_size
 
-    # Dequantize activations: INT4 packed → bf16 via ESIMD kernel
+    # Unpack INT4 to int8 via ESIMD kernel
+    act_i8 = omni.svdq.unpack_int4(act_dev.view(torch.uint8), True)
     if act_unsigned:
-        # For unsigned: dequant as signed, then add (8 * ascale) to each group
-        act_bf16 = omni.svdq.dequantize_w4(
-            act_dev.view(torch.uint8), ascales_dev.to(torch.bfloat16).contiguous(), torch.bfloat16
-        )
-        # Correct for unsigned offset: each value was stored as (val - 8), need to add 8*scale
-        group_size = K // ascales_dev.shape[0]
-        num_groups = K // group_size
-        offset = (ascales_dev.to(torch.bfloat16).T * 8).unsqueeze(2).expand(-1, -1, group_size)
-        act_bf16 = act_bf16.reshape(M, num_groups, group_size) + offset
-        act_bf16 = act_bf16.reshape(M, K)
-    else:
-        act_bf16 = omni.svdq.dequantize_w4(
-            act_dev.view(torch.uint8), ascales_dev.to(torch.bfloat16).contiguous(), torch.bfloat16
-        )
+        act_i8 = (act_i8.to(torch.int16) + 8).to(torch.int8)
+    wgt_i8 = omni.svdq.unpack_int4(wgt_dev.view(torch.uint8), True)
 
-    # oneDNN INT4 GEMM (bf16 activations × INT4 weights → bf16 output)
-    # Use onednn_int4_gemm (non-preconverted) to avoid caching converted weights
-    # which would consume ~3GB extra VRAM for large models like FLUX.
-    result = omni.svdq.onednn_int4_gemm(act_bf16, wgt_dev.view(torch.uint8), wscales_dev)
-    del act_bf16
+    # Vectorized fp32 dequant + single fp32 matmul
+    ascales_f = ascales_dev.to(torch.float32)
+    wscales_f = wscales_dev.to(torch.float32)
+
+    act_deq = act_i8.float().reshape(M, num_groups, group_size)
+    act_deq *= ascales_f.T.unsqueeze(2)
+    wgt_deq = wgt_i8.float().reshape(N, num_groups, group_size)
+    wgt_deq *= wscales_f.T.unsqueeze(2)
+
+    result = (act_deq.reshape(M, K) @ wgt_deq.reshape(N, K).T).to(torch.bfloat16)
+    del act_i8, wgt_i8, act_deq, wgt_deq
 
     # Step 3: Apply alpha scaling
     if alpha != 1.0:
@@ -318,18 +316,16 @@ def _quantize_output_for_next_layer_xpu(
     # Apply smooth factor for next layer (bf16 to avoid fp16 overflow, nan_to_num for inf)
     if smooth_factor is not None:
         sf = smooth_factor.to(compute_device) if smooth_factor.device != compute_device else smooth_factor
-        rcp_smooth = (1.0 / sf.float()).to(torch.bfloat16)
-        x_f16 = (x.to(torch.bfloat16) * rcp_smooth).to(torch.float16)
-        x_f16.nan_to_num_(nan=0.0, posinf=65504.0, neginf=-65504.0)
+        x_smooth = x.float() / sf.float()  # fp32 division for precision
     else:
-        x_f16 = x.to(torch.float16)
+        x_smooth = x.float()
 
     # Pad
     if M_pad > M:
-        x_padded = torch.zeros(M_pad, N, dtype=x_f16.dtype, device=compute_device)
-        x_padded[:M] = x_f16
+        x_padded = torch.zeros(M_pad, N, dtype=x_smooth.dtype, device=compute_device)
+        x_padded[:M] = x_smooth
     else:
-        x_padded = x_f16.contiguous()
+        x_padded = x_smooth.contiguous()
 
     # Quantize to unsigned INT4 [0, 15] for fc2's act_unsigned path.
     # omni quantize_act_int4 always produces signed [-8, 7]. We quantize as signed
