@@ -183,31 +183,33 @@ def svdq_gemm_w4a4_xpu(
     ascales_dev = ascales.to(compute_device) if ascales.device != compute_device else ascales
     wscales_dev = wscales.to(compute_device) if wscales.device != compute_device else wscales
 
-    # W4A4 GEMM: unpack INT4 → dequant with per-group scales → fp32 matmul.
-    # Vectorized dequant (no Python loop) + single large fp32 matmul.
-    # fp32 is exact for INT4*INT4 products (max 8*8=64, well within fp32 precision).
-    # This is 9x faster than the group-wise torch._int_mm loop while matching its precision.
+    # W4A4 GEMM: ESIMD dequant + oneDNN bf16 GEMM.
+    # Uses existing dequantize_w4 ESIMD kernel (fused unpack+scale, 0.2ms) for activations,
+    # then oneDNN INT4 GEMM (1ms) for the matmul. Total ~1.2ms vs 11.6ms for fp32 matmul.
     K = act_dev.shape[1] * 2  # packed INT4: K/2 bytes
-    group_size = K // ascales_dev.shape[0]
-    num_groups = K // group_size
 
-    # Unpack INT4 to int8
-    act_i8 = omni.svdq.unpack_int4(act_dev.view(torch.uint8), True)
+    # Dequantize activations: INT4 packed → bf16 via ESIMD kernel
     if act_unsigned:
-        act_i8 = (act_i8.to(torch.int16) + 8).to(torch.int8)
-    wgt_i8 = omni.svdq.unpack_int4(wgt_dev.view(torch.uint8), True)
+        # For unsigned: dequant as signed, then add (8 * ascale) to each group
+        act_bf16 = omni.svdq.dequantize_w4(
+            act_dev.view(torch.uint8), ascales_dev.to(torch.bfloat16).contiguous(), torch.bfloat16
+        )
+        # Correct for unsigned offset: each value was stored as (val - 8), need to add 8*scale
+        group_size = K // ascales_dev.shape[0]
+        num_groups = K // group_size
+        offset = (ascales_dev.to(torch.bfloat16).T * 8).unsqueeze(2).expand(-1, -1, group_size)
+        act_bf16 = act_bf16.reshape(M, num_groups, group_size) + offset
+        act_bf16 = act_bf16.reshape(M, K)
+    else:
+        act_bf16 = omni.svdq.dequantize_w4(
+            act_dev.view(torch.uint8), ascales_dev.to(torch.bfloat16).contiguous(), torch.bfloat16
+        )
 
-    # Vectorized dequant: reshape to [M, groups, gs], multiply by per-group scale, flatten
-    ascales_f = ascales_dev.to(torch.float32)  # [groups, M]
-    wscales_f = wscales_dev.to(torch.float32)  # [groups, N]
-
-    act_deq = act_i8.float().reshape(M, num_groups, group_size)
-    act_deq *= ascales_f.T.unsqueeze(2)  # [M, groups] → [M, groups, 1]
-    wgt_deq = wgt_i8.float().reshape(N, num_groups, group_size)
-    wgt_deq *= wscales_f.T.unsqueeze(2)  # [N, groups] → [N, groups, 1]
-
-    result = (act_deq.reshape(M, K) @ wgt_deq.reshape(N, K).T).to(torch.bfloat16)
-    del act_i8, wgt_i8, act_deq, wgt_deq
+    # oneDNN INT4 GEMM (bf16 activations × INT4 weights → bf16 output)
+    # Use onednn_int4_gemm (non-preconverted) to avoid caching converted weights
+    # which would consume ~3GB extra VRAM for large models like FLUX.
+    result = omni.svdq.onednn_int4_gemm(act_bf16, wgt_dev.view(torch.uint8), wscales_dev)
+    del act_bf16
 
     # Step 3: Apply alpha scaling
     if alpha != 1.0:
