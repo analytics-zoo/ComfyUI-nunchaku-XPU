@@ -157,13 +157,13 @@ class SVDQW4A4Linear(nn.Module):
         if x.device != xpu_device:
             x = x.to(xpu_device)
 
-        # Apply smooth factor + bf16->fp16 cast. Default to the native torch
-        # path; set NUNCHAKU_USE_FUSED_SMOOTH=1 to use the ESIMD fused kernel.
+        # Apply smooth factor + bf16->fp16 cast via ESIMD fused kernel.
+        # Set NUNCHAKU_USE_FUSED_SMOOTH=0 to fall back to native torch path.
         if self.smooth_factor is not None:
             if not hasattr(self, '_xpu_rcp_smooth') or self._xpu_rcp_smooth is None:
                 self._xpu_rcp_smooth = (1.0 / self.smooth_factor.float()).to(torch.float16)
             import os as _os
-            if _os.environ.get("NUNCHAKU_USE_FUSED_SMOOTH", "0") == "1":
+            if _os.environ.get("NUNCHAKU_USE_FUSED_SMOOTH", "1") == "1":
                 x_gemm = omni_svdq.fused_smooth_mul_convert(x, self._xpu_rcp_smooth)
                 x_gemm.nan_to_num_(nan=0.0, posinf=65504.0, neginf=-65504.0)
             else:
