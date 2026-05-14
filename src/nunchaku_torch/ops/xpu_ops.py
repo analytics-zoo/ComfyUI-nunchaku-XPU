@@ -183,31 +183,27 @@ def svdq_gemm_w4a4_xpu(
     ascales_dev = ascales.to(compute_device) if ascales.device != compute_device else ascales
     wscales_dev = wscales.to(compute_device) if wscales.device != compute_device else wscales
 
-    # W4A4 GEMM: unpack INT4 → fp32 dequant → fp32 matmul.
-    # Uses fp32 throughout to match CPU W4A4 reference precision exactly.
-    # bf16 dequant + oneDNN GEMM has ~0.1% per-layer rounding error that accumulates
-    # to visible artifacts (color banding) on certain seeds over 30 layers × 9 steps.
+    # W4A4 GEMM: dequant activation to bf16, then use oneDNN INT4 GEMM for weights.
+    # Avoids per-step full-weight fp32 dequant (was 28 GB/step intermediates).
     K = act_dev.shape[1] * 2
     group_size = K // ascales_dev.shape[0]
     num_groups = K // group_size
 
-    # Unpack INT4 to int8 via ESIMD kernel
+    # Unpack INT4 activation to int8, dequant to bf16
     act_i8 = omni.svdq.unpack_int4(act_dev.view(torch.uint8), True)
     if act_unsigned:
         act_i8 = (act_i8.to(torch.int16) + 8).to(torch.int8)
-    wgt_i8 = omni.svdq.unpack_int4(wgt_dev.view(torch.uint8), True)
 
-    # Vectorized fp32 dequant + single fp32 matmul
     ascales_f = ascales_dev.to(torch.float32)
-    wscales_f = wscales_dev.to(torch.float32)
-
     act_deq = act_i8.float().reshape(M, num_groups, group_size)
     act_deq *= ascales_f.T.unsqueeze(2)
-    wgt_deq = wgt_i8.float().reshape(N, num_groups, group_size)
-    wgt_deq *= wscales_f.T.unsqueeze(2)
+    act_bf16 = act_deq.reshape(M, K).to(torch.bfloat16)
+    del act_i8, act_deq, ascales_f
 
-    result = (act_deq.reshape(M, K) @ wgt_deq.reshape(N, K).T).to(torch.bfloat16)
-    del act_i8, wgt_i8, act_deq, wgt_deq
+    # oneDNN INT4 GEMM — weights stay packed, no per-step full dequant
+    torch.xpu.empty_cache()
+    result = omni.svdq.onednn_int4_gemm(act_bf16, wgt_dev.view(torch.uint8), wscales_dev)
+    del act_bf16
 
     # Step 3: Apply alpha scaling
     if alpha != 1.0:
