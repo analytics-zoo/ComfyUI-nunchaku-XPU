@@ -53,7 +53,32 @@ logger = logging.getLogger(__name__)
 
 logger.info("=" * 40 + " ComfyUI-nunchaku-XPU Initialization " + "=" * 40)
 
-logger.info(f"XPU available: {has_xpu()}")
+xpu_available = has_xpu()
+logger.info(f"XPU available: {xpu_available}")
+
+if xpu_available:
+    try:
+        import comfy_kitchen as ck
+
+        kitchen_xpu = ck.list_backends()["xpu"]
+        kitchen_w4a16 = "svdquant_w4a16_linear" in kitchen_xpu["capabilities"]
+        logger.info(
+            "Comfy Kitchen %s: XPU backend=%s, SVDQuant W4A16=%s",
+            ck.__version__,
+            kitchen_xpu["available"],
+            kitchen_w4a16,
+        )
+        if not kitchen_xpu["available"] or not kitchen_w4a16:
+            logger.warning(
+                "Comfy Kitchen does not advertise the SVDQuant W4A16 XPU "
+                "capability; Nunchaku will use its precise W4A4 fallback"
+            )
+    except (ImportError, RuntimeError) as exc:
+        logger.warning(
+            "Comfy Kitchen XPU integration is unavailable; Nunchaku will use "
+            "its precise W4A4 fallback: %s",
+            exc,
+        )
 
 from .utils import get_plugin_version
 

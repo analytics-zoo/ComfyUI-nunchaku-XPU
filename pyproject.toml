@@ -37,7 +37,8 @@ dependencies = [
 
 # XPU-specific optional dependencies
 optional-dependencies.xpu = [
-  # omni_xpu_kernel should be installed separately from llm-scaler
+  # The image pins nunchaku-torch and Comfy Kitchen source revisions.
+  # omni_xpu_kernel is built separately from Intel llm-scaler for the target.
   # torch with XPU support should be installed separately
 ]
 
@@ -116,7 +117,7 @@ per-file-ignores."__init__.py" = [ "E402" ]
 
 [tool.isort]
 profile = "black"
-known_first_party = [ "nunchaku", "omni_xpu_kernel" ]
+known_first_party = [ "comfy_kitchen", "nunchaku", "nunchaku_torch", "omni_xpu_kernel" ]
 line_length = 120
 
 [tool.comfy]

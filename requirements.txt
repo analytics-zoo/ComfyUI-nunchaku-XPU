@@ -14,5 +14,6 @@ timm
 safetensors
 einops
 packaging
-# For Intel XPU: install omni_xpu_kernel from llm-scaler
+# Intel XPU images also pin nunchaku-torch, Comfy Kitchen XPU, and the
+# target-specific omni_xpu_kernel companion wheel from Intel llm-scaler.
 # For NVIDIA CUDA: install nunchaku
