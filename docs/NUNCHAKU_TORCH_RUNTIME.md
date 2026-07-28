@@ -1,6 +1,9 @@
-# nunchaku-torch
+# Embedded `nunchaku_torch` Runtime
 
-Standalone PyTorch runtime for Nunchaku SVDQuant W4A4 inference on CPU, XPU, and CUDA.
+This repository bundles the PyTorch runtime used by the ComfyUI nodes for
+Nunchaku SVDQuant W4A4 inference on CPU, XPU, and CUDA. The runtime is kept in
+the top-level `nunchaku_torch/` package and is released together with
+ComfyUI-nunchaku-XPU; a separate runtime checkout or package is not required.
 
 ## Overview
 
@@ -13,7 +16,7 @@ Standalone PyTorch runtime for Nunchaku SVDQuant W4A4 inference on CPU, XPU, and
 ## Install
 
 ```bash
-# Install PyTorch for your backend first, then:
+# Install PyTorch for your backend first, then install this repository:
 pip install -e .
 
 # For XPU acceleration, install the reviewed Comfy Kitchen integration and
@@ -90,10 +93,12 @@ python scripts/validate.py --device xpu \
 
 ## Notes
 
-- Self-contained: does not depend on the `nunchaku` PyPI package
+- Self-contained: does not depend on either the `nunchaku` PyPI package or a
+  separate `nunchaku-torch` repository
 - The default XPU SVDQuant W4A16 route is managed by Comfy Kitchen. Kitchen
   owns capability detection, preparation, dispatch, diagnostics, and safe
-  fallback; `nunchaku-torch` retains the model and weight lifecycle.
+  fallback; the bundled `nunchaku_torch` package retains the model and weight
+  lifecycle.
 - XPU acceleration requires `omni_xpu_kernel` from
   [Intel llm-scaler](https://github.com/intel/llm-scaler) with ESIMD RMSNorm,
   Rotary, and oneDNN INT4 GEMM kernels.

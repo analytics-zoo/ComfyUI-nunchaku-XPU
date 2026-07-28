@@ -7,7 +7,7 @@ from nunchaku_torch.zimage import GenerationConfig, save_image
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Smoke-validate standalone ZImage generation."
+        description="Smoke-validate ZImage generation with the bundled runtime."
     )
     parser.add_argument("--quant-path", required=True)
     parser.add_argument("--base-model", required=True)

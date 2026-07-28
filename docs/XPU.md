@@ -1,26 +1,23 @@
 # Intel XPU Support
 
-This fork adds Intel XPU support through
-[nunchaku-torch](https://github.com/xiangyuT/nunchaku-torch),
-[Comfy Kitchen XPU](https://github.com/xiangyuT/comfy-kitchen-xpu), and the
+This repository adds Intel XPU support through its bundled `nunchaku_torch`
+runtime, [Comfy Kitchen XPU](https://github.com/xiangyuT/comfy-kitchen-xpu),
+and the
 `omni_xpu_kernel` native companion package from
 [Intel llm-scaler](https://github.com/intel/llm-scaler).
 
 The integration boundary is:
 
 ```text
-ComfyUI node -> nunchaku-torch model lifecycle
+ComfyUI node -> bundled nunchaku_torch model lifecycle
              -> Comfy Kitchen preparation/dispatch/fallback
              -> omni_xpu_kernel ESIMD/oneDNN kernels
 ```
 
-The current source-integration checkpoints are:
-
-- `nunchaku-torch@f1dffcd`
-- `comfy-kitchen-xpu@399afcc`
-
-The Docker image must pin both revisions and build `omni_xpu_kernel` for the
-actual XPU target. A native wheel from another target is not interchangeable.
+The bundled runtime preserves the accepted standalone history through
+`nunchaku-torch@f1dffcd`. The Docker image pins one custom-node revision plus
+the reviewed Comfy Kitchen revision and builds `omni_xpu_kernel` for the actual
+XPU target. A native wheel from another target is not interchangeable.
 
 ## Supported Workflows
 
@@ -34,7 +31,6 @@ All sample images generated on **Intel Arc B580** (11 GB VRAM), 512x512, prompt:
 
 - Intel Arc GPU (A-series or B-series) with XPU support
 - PyTorch with XPU backend (`torch.xpu`)
-- [nunchaku-torch](https://github.com/xiangyuT/nunchaku-torch) runtime package
 - [Comfy Kitchen XPU](https://github.com/xiangyuT/comfy-kitchen-xpu) with the
   `svdquant_w4a16_linear` XPU capability
 - [`omni_xpu_kernel`](https://github.com/intel/llm-scaler/tree/main/omni/omni_xpu_kernel)

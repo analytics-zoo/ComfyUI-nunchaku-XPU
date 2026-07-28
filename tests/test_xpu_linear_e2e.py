@@ -3,11 +3,15 @@ End-to-end test: SVDQW4A4Linear and AWQW4A16Linear on XPU via nunchaku_torch.
 
 Tests the full ops dispatch chain: nunchaku_torch -> ops dispatcher -> xpu_ops -> omni_xpu_kernel
 """
-import sys
 import time
-sys.path.insert(0, "src")
 
+import pytest
 import torch
+
+pytestmark = pytest.mark.skipif(
+    not (hasattr(torch, "xpu") and torch.xpu.is_available()),
+    reason="Intel XPU is unavailable",
+)
 
 
 def test_svdq_linear_dispatch():
@@ -43,8 +47,6 @@ def test_svdq_linear_dispatch():
     print(f"SVDQW4A4Linear [{K}->{N}]: shape={y.shape}, time={elapsed*1000:.2f}ms")
     assert y.shape == (1, 64, N), f"Bad shape: {y.shape}"
     assert y.device.type == "xpu", f"Bad device: {y.device}"
-    print("  PASS")
-    return True
 
 
 def test_awq_linear_dispatch():
@@ -71,8 +73,6 @@ def test_awq_linear_dispatch():
     print(f"AWQW4A16Linear [{K}->{N}]: shape={y.shape}")
     assert y.shape == (1, N), f"Bad shape: {y.shape}"
     assert y.device.type == "xpu", f"Bad device: {y.device}"
-    print("  PASS")
-    return True
 
 
 def test_fused_gelu_mlp_dispatch():
@@ -108,35 +108,3 @@ def test_fused_gelu_mlp_dispatch():
     print(f"fused_gelu_mlp [{K}->{hidden}->{N}]: shape={y.shape}")
     assert y.shape == (1, 64, N), f"Bad shape: {y.shape}"
     assert y.device.type == "xpu", f"Bad device: {y.device}"
-    print("  PASS")
-    return True
-
-
-if __name__ == "__main__":
-    if not (hasattr(torch, "xpu") and torch.xpu.is_available()):
-        print("SKIP: No XPU device")
-        sys.exit(0)
-
-    print("=" * 60)
-    print("nunchaku_torch XPU dispatch e2e tests")
-    print("=" * 60)
-
-    results = {}
-    for name, fn in [
-        ("svdq_linear", test_svdq_linear_dispatch),
-        ("awq_linear", test_awq_linear_dispatch),
-        ("fused_gelu_mlp", test_fused_gelu_mlp_dispatch),
-    ]:
-        try:
-            results[name] = fn()
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            results[name] = False
-        print()
-
-    print("SUMMARY:")
-    for name, ok in results.items():
-        print(f"  {name}: {'PASS' if ok else 'FAIL'}")
-    all_pass = all(results.values())
-    print(f"\nOverall: {'ALL PASS' if all_pass else 'SOME FAILED'}")

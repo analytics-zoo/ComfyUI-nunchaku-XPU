@@ -82,11 +82,9 @@ if xpu_available:
 
 from .utils import get_plugin_version
 
-try:
-    import nunchaku_torch
-    logger.info(f"nunchaku_torch version: {nunchaku_torch.__version__}")
-except ImportError:
-    logger.warning("nunchaku_torch not found - install from analytics-zoo/nunchaku-torch")
+import nunchaku_torch
+
+logger.info(f"bundled nunchaku_torch version: {nunchaku_torch.__version__}")
 
 logger.info(f"ComfyUI-nunchaku-XPU version: {get_plugin_version()}")
 

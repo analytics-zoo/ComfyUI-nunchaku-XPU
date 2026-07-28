@@ -5,9 +5,10 @@ requires = [ "setuptools>=61", "wheel" ]
 
 [project]
 name = "ComfyUI-nunchaku-XPU"
-version = "1.2.1-xpu.2"
-description = "Nunchaku ComfyUI Node with Intel XPU support via nunchaku-torch runtime."
-license = { file = "LICENCE.txt" }
+version = "1.2.1+xpu.3"
+description = "Nunchaku ComfyUI Node with an embedded PyTorch runtime for Intel XPU."
+license = "Apache-2.0"
+license-files = [ "LICENCE.txt" ]
 requires-python = ">=3.10,<3.14"
 classifiers = [
   "Programming Language :: Python :: 3 :: Only",
@@ -18,12 +19,13 @@ classifiers = [
 ]
 dependencies = [
   "accelerate>=1.10",
-  "diffusers>=0.35",
+  "diffusers>=0.36",
   "facexlib",
   "huggingface-hub>=0.34",
   "insightface",
   "onnxruntime",
   "opencv-python",
+  "pillow",
   "peft>=0.17",
   "protobuf",
   "pyyaml",
@@ -33,11 +35,13 @@ dependencies = [
   "safetensors",
   "einops",
   "packaging",
+  "transformers>=4.54",
 ]
 
 # XPU-specific optional dependencies
 optional-dependencies.xpu = [
-  # The image pins nunchaku-torch and Comfy Kitchen source revisions.
+  # The nunchaku_torch runtime is embedded in this distribution.
+  # The image pins Comfy Kitchen and Omni source revisions.
   # omni_xpu_kernel is built separately from Intel llm-scaler for the target.
   # torch with XPU support should be installed separately
 ]
@@ -80,11 +84,15 @@ optional-dependencies.torch26 = [ "nunchaku==1.0.1+torch2.6; sys_platform!='darw
 optional-dependencies.torch27 = [ "nunchaku==1.0.1+torch2.7; sys_platform!='darwin'", "torch>=2.7,<2.8" ]
 optional-dependencies.torch28 = [ "nunchaku==1.0.1+torch2.8; sys_platform!='darwin'", "torch>=2.8,<2.9" ]
 optional-dependencies.torchpre = [ "nunchaku==1.0.1+torch2.10; sys_platform!='darwin'" ]
-urls.Repository = "https://github.com/analytics-zoo/ComfyUI-nunchaku-XPU"
+urls.Repository = "https://github.com/xiangyuT/ComfyUI-nunchaku-XPU"
+urls.Upstream = "https://github.com/nunchaku-ai/ComfyUI-nunchaku"
 entry-points."comfyui.custom_nodes".comfyui_nunchaku = "comfyui_nunchaku"
 
+[project.scripts]
+nunchaku-torch = "nunchaku_torch.zimage_cli:main"
+
 [tool.setuptools]
-package-dir = { "comfyui_nunchaku" = "." }
+package-dir = { "comfyui_nunchaku" = ".", "nunchaku_torch" = "nunchaku_torch" }
 packages = [
   "comfyui_nunchaku",
   "comfyui_nunchaku.mixins",
@@ -98,6 +106,14 @@ packages = [
   "comfyui_nunchaku.nodes.tools",
   "comfyui_nunchaku.wrappers",
   "comfyui_nunchaku.model_patcher",
+  "nunchaku_torch",
+  "nunchaku_torch.lora",
+  "nunchaku_torch.lora.flux",
+  "nunchaku_torch.models",
+  "nunchaku_torch.models.attention_processors",
+  "nunchaku_torch.models.transformers",
+  "nunchaku_torch.models.unets",
+  "nunchaku_torch.ops",
 ]
 
 [tool.setuptools.package-data]

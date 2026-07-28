@@ -14,6 +14,13 @@
 
 This repository provides the ComfyUI plugin for [**Nunchaku**](https://github.com/nunchaku-ai/nunchaku), an efficient inference engine for 4-bit neural networks quantized with [SVDQuant](http://arxiv.org/abs/2411.05007). For the quantization library, check out [DeepCompressor](https://github.com/nunchaku-ai/deepcompressor).
 
+This XPU-focused distribution retains the upstream ComfyUI-nunchaku source
+and adds Intel XPU execution through Comfy Kitchen and `omni_xpu_kernel`. We
+thank the Nunchaku and ComfyUI upstream projects for the model integration and
+node framework this work builds on. See [Intel XPU Support](docs/XPU.md) for
+the integration boundary and requirements. The `nunchaku_torch` runtime is
+bundled in this repository; users do not need a separate runtime checkout.
+
 Join our user groups on [**Discord**](https://discord.gg/Wk6PnwX9Sm) and [**WeChat**](https://huggingface.co/datasets/nunchaku-ai/cdn/resolve/main/nunchaku/assets/wechat.jpg) for discussions—details [here](https://github.com/nunchaku-ai/nunchaku/issues/149). If you have any questions, run into issues, or are interested in contributing, feel free to share your thoughts with us!
 
 # Nunchaku ComfyUI Plugin

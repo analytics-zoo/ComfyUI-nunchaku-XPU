@@ -160,7 +160,7 @@ def _reset_memory_stats(device_type: str) -> None:
 def _load_runtime_pipeline(
     config: BenchmarkConfig, device_str: str
 ) -> Any:
-    """Load pipeline using nunchaku_torch (our standalone implementation)."""
+    """Load a pipeline using the bundled nunchaku_torch runtime."""
     from nunchaku_torch.zimage import GenerationConfig, load_pipeline
 
     gen_config = GenerationConfig(

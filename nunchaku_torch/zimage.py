@@ -18,7 +18,7 @@ class GenerationConfig:
     device: str = "auto"
     height: int = 256
     width: int = 256
-    steps: int = 12
+    steps: int = 9
     guidance: float = 0.0
     seed: int = 12345
 
