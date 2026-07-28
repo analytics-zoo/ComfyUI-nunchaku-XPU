@@ -250,3 +250,37 @@ def test_runtime_switch_to_w4a4_restores_source(monkeypatch):
     with torch.no_grad():
         output = linear(x)
     assert output.shape == (x.shape[0], x.shape[1], linear.out_features)
+
+
+def test_missing_kitchen_xpu_capability_uses_w4a4_fallback(monkeypatch):
+    import comfy_kitchen as ck
+    from nunchaku_torch.models.linear import SVDQW4A4Linear
+
+    linear, x = _make_linear()
+    signed_qweight = linear.qweight.detach().clone()
+
+    monkeypatch.setattr(
+        ck,
+        "list_backends",
+        lambda: {
+            "xpu": {
+                "available": True,
+                "capabilities": [],
+            }
+        },
+    )
+
+    def fake_w4a4(self, value):
+        assert self._xpu_w4a16_prepared is None
+        assert torch.equal(self.qweight, signed_qweight)
+        return torch.zeros(
+            value.shape[0],
+            self.out_features,
+            dtype=value.dtype,
+            device=value.device,
+        )
+
+    monkeypatch.setattr(SVDQW4A4Linear, "_forward_xpu_w4a4", fake_w4a4)
+    with torch.no_grad():
+        output = linear(x)
+    assert output.shape == (x.shape[0], x.shape[1], linear.out_features)

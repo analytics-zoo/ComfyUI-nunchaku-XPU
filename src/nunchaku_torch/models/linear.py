@@ -139,6 +139,15 @@ class SVDQW4A4Linear(nn.Module):
         except ImportError:
             return self._forward_xpu_w4a4(x)
 
+        if self._xpu_w4a16_prepared is None:
+            xpu_backend = ck.list_backends().get("xpu", {})
+            if (
+                not xpu_backend.get("available", False)
+                or "svdquant_w4a16_linear"
+                not in xpu_backend.get("capabilities", ())
+            ):
+                return self._forward_xpu_w4a4(x)
+
         # Force W4A4 for layers that need it (set by model wrapper)
         if getattr(self, '_xpu_force_w4a4', False):
             self._restore_xpu_w4a16_source()
