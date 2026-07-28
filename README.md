@@ -5,7 +5,8 @@ Standalone PyTorch runtime for Nunchaku SVDQuant W4A4 inference on CPU, XPU, and
 ## Overview
 
 - Pure Python package — no custom C/CUDA extensions required
-- Supports CPU, Intel XPU (via `omni_xpu_kernel` ESIMD/oneDNN kernels), and CUDA backends
+- Supports CPU, Intel XPU (via Comfy Kitchen and
+  `omni_xpu_kernel` ESIMD/oneDNN kernels), and CUDA backends
 - SVDQuant W4A4 quantized model inference with LoRA support
 - Currently validated models: ZImage (Z-Image-Turbo), QwenImage
 
@@ -15,7 +16,10 @@ Standalone PyTorch runtime for Nunchaku SVDQuant W4A4 inference on CPU, XPU, and
 # Install PyTorch for your backend first, then:
 pip install -e .
 
-# For XPU acceleration, also install omni_xpu_kernel:
+# For XPU acceleration, install the reviewed Comfy Kitchen integration and
+# the target-specific omni_xpu_kernel companion wheel:
+pip install --no-deps \
+  "git+https://github.com/xiangyuT/comfy-kitchen-xpu.git@399afcc"
 cd /path/to/omni_xpu_kernel && pip install -e . --no-build-isolation
 ```
 
@@ -87,5 +91,10 @@ python scripts/validate.py --device xpu \
 ## Notes
 
 - Self-contained: does not depend on the `nunchaku` PyPI package
-- XPU acceleration requires `omni_xpu_kernel` with ESIMD RMSNorm, Rotary, and oneDNN INT4 GEMM kernels
+- The default XPU SVDQuant W4A16 route is managed by Comfy Kitchen. Kitchen
+  owns capability detection, preparation, dispatch, diagnostics, and safe
+  fallback; `nunchaku-torch` retains the model and weight lifecycle.
+- XPU acceleration requires `omni_xpu_kernel` from
+  [Intel llm-scaler](https://github.com/intel/llm-scaler) with ESIMD RMSNorm,
+  Rotary, and oneDNN INT4 GEMM kernels.
 - For multi-GPU setups, use `ZE_AFFINITY_MASK` to select XPU devices

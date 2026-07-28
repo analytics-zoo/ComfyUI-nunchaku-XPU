@@ -87,6 +87,7 @@ class SVDQW4A4Linear(nn.Module):
             self.wcscales = None
 
         self.act_unsigned = act_unsigned
+        self._xpu_w4a16_prepared = None
 
     @classmethod
     def from_linear(cls, linear: nn.Linear, **kwargs):
@@ -125,7 +126,8 @@ class SVDQW4A4Linear(nn.Module):
     def _forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
         """W4A16 or W4A4 GEMM on XPU, auto-selected per model.
 
-        W4A16 (fast): fused smooth → fp16 → oneDNN INT4 GEMM. Works for Z-Image/FLUX.
+        W4A16 (fast): Comfy Kitchen managed smooth → fp16 → oneDNN INT4
+        GEMM. Works for Z-Image/FLUX.
         W4A4 (precise): quantize → dequant → fp32 matmul. Required for QwenImage
         where W4A16 precision is insufficient (10% cosine error per layer).
 
@@ -133,21 +135,14 @@ class SVDQW4A4Linear(nn.Module):
         or can be forced via _xpu_force_w4a4 attribute.
         """
         try:
-            from omni_xpu_kernel import svdq as omni_svdq
+            import comfy_kitchen as ck
         except ImportError:
-            M = x.shape[0]
-            output = torch.empty(M, self.out_features, dtype=x.dtype, device=x.device)
-            quantized_x, ascales, lora_act = self.quantize(x)
-            self.forward_quant(quantized_x, ascales, lora_act, output)
-            return output
+            return self._forward_xpu_w4a4(x)
 
         # Force W4A4 for layers that need it (set by model wrapper)
         if getattr(self, '_xpu_force_w4a4', False):
-            M = x.shape[0]
-            output = torch.empty(M, self.out_features, dtype=x.dtype, device=x.device)
-            quantized_x, ascales, lora_act = self.quantize(x)
-            self.forward_quant(quantized_x, ascales, lora_act, output)
-            return output
+            self._restore_xpu_w4a16_source()
+            return self._forward_xpu_w4a4(x)
 
         # W4A16 fast path
         input_device = x.device
@@ -157,49 +152,84 @@ class SVDQW4A4Linear(nn.Module):
         if x.device != xpu_device:
             x = x.to(xpu_device)
 
-        # Apply smooth factor + bf16->fp16 cast via ESIMD fused kernel.
-        # Set NUNCHAKU_USE_FUSED_SMOOTH=0 to fall back to native torch path.
-        if self.smooth_factor is not None:
-            if not hasattr(self, '_xpu_rcp_smooth') or self._xpu_rcp_smooth is None:
-                self._xpu_rcp_smooth = (1.0 / self.smooth_factor.float()).to(torch.float16)
-            import os as _os
-            if _os.environ.get("NUNCHAKU_USE_FUSED_SMOOTH", "1") == "1":
-                x_gemm = omni_svdq.fused_smooth_mul_convert(x, self._xpu_rcp_smooth)
-                x_gemm.nan_to_num_(nan=0.0, posinf=65504.0, neginf=-65504.0)
-            else:
-                x_gemm = x.to(torch.float16).mul_(self._xpu_rcp_smooth)
-                x_gemm.nan_to_num_(nan=0.0, posinf=65504.0, neginf=-65504.0)
-        else:
-            x_gemm = x.to(torch.float16)
-
-        # Prepare oneDNN weights (cached)
-        if not hasattr(self, '_xpu_packed_u4') or self._xpu_packed_u4 is None:
-            wgt_u8 = self.qweight.view(torch.uint8)
-            self._xpu_packed_u4, self._xpu_scales_f16 = omni_svdq.prepare_onednn_weights(
-                wgt_u8, self.wscales
+        prepared = self._xpu_w4a16_prepared
+        if prepared is not None and (
+            prepared.source_qweight is not self.qweight
+            or prepared.source_wscales is not self.wscales
+            or prepared.source_smooth is not self.smooth_factor
+        ):
+            self._restore_xpu_w4a16_source()
+            prepared = None
+        if prepared is None:
+            prepared = ck.prepare_svdquant_w4a16_for_xpu(
+                self.qweight,
+                self.wscales,
+                self.smooth_factor,
+                destructive=True,
             )
+            self._xpu_w4a16_prepared = prepared
 
-        # W4A16 GEMM with fused LoRA+bias
-        has_lora = self.proj_down is not None and self.proj_up is not None
-        if has_lora or self.bias is not None:
-            M, N = x_gemm.shape[0], self.out_features
-            dst = torch.zeros(M, N, dtype=torch.bfloat16, device=x_gemm.device)
-            if has_lora:
-                lora_out = (x.to(torch.bfloat16) @ self.proj_down.to(torch.bfloat16)) @ self.proj_up.to(torch.bfloat16).T
-                dst.add_(lora_out)
-                del lora_out
-            if self.bias is not None:
-                dst.add_(self.bias.to(torch.bfloat16))
-            omni_svdq.onednn_int4_gemm_add_to_output(
-                x_gemm, self._xpu_packed_u4, self._xpu_scales_f16, dst
-            )
-            result = dst
-        else:
-            result = omni_svdq.onednn_int4_gemm_preconverted(
-                x_gemm, self._xpu_packed_u4, self._xpu_scales_f16
-            )
+        result = ck.svdquant_w4a16_linear(
+            x,
+            prepared,
+            lora_down=self.proj_down,
+            lora_up=self.proj_up,
+            bias=self.bias,
+            output_dtype=x_orig_dtype,
+            validate=False,
+        )
+        return result.to(input_device)
 
-        return result.to(x_orig_dtype).to(input_device)
+    def _forward_xpu_w4a4(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the existing precise W4A4 fallback with checkpoint-form weights."""
+        output = torch.empty(
+            x.shape[0],
+            self.out_features,
+            dtype=x.dtype,
+            device=x.device,
+        )
+        quantized_x, ascales, lora_act = self.quantize(x)
+        self.forward_quant(quantized_x, ascales, lora_act, output)
+        return output
+
+    def _restore_xpu_w4a16_source(self) -> None:
+        """Drop the prepared cache and restore signed checkpoint bytes."""
+        prepared = self._xpu_w4a16_prepared
+        if prepared is None:
+            return
+        import comfy_kitchen as ck
+
+        ck.restore_svdquant_w4a16_source_(prepared)
+        self._xpu_w4a16_prepared = None
+
+    def _apply(self, fn, recurse=True):
+        self._restore_xpu_w4a16_source()
+        return super()._apply(fn, recurse=recurse)
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        self._restore_xpu_w4a16_source()
+        return super()._save_to_state_dict(destination, prefix, keep_vars)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        self._restore_xpu_w4a16_source()
+        return super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def quantize(
         self, x: torch.Tensor, pad_size: int = 256
