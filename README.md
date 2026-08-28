@@ -1,3 +1,49 @@
+# ComfyUI-nunchaku-XPU
+
+> [!IMPORTANT]
+> **Experimental Intel XPU fork — limited validation scope**
+>
+> The XPU changes in this fork are developed and performance-tuned for work
+> related to [Intel llm-scaler](https://github.com/intel/llm-scaler), primarily
+> on Ubuntu 24.04 LTS with Intel Arc Pro B70 (BMG-G31, device ID `0xE223`).
+>
+> Other operating systems, GPU models, software environments, workloads, and
+> configurations are outside the validated scope. Their compatibility,
+> correctness, output quality, stability, and performance are not guaranteed.
+>
+> If you have a specific requirement outside the current scope, you may open a
+> relevant issue with the complete environment, expected use case, and a
+> reproducible example. Opening an issue provides a way to document and discuss
+> the request. Whether it can be explored or supported will depend on its
+> relevance, reproducibility, and available capacity. The validated scope will
+> be updated only after any additional support has been implemented and
+> validated.
+>
+> This is a personal downstream fork, not an upstream release or an official
+> commitment to support the upstream project on Intel XPU.
+
+## Intel XPU integration
+
+This fork adds Intel XPU execution to ComfyUI-nunchaku through the bundled
+`nunchaku_torch` runtime, [Comfy Kitchen XPU](https://github.com/xiangyuT/comfy-kitchen-xpu),
+and the `omni_xpu_kernel` native package from
+[Intel llm-scaler](https://github.com/intel/llm-scaler).
+
+See [Intel XPU Support](docs/XPU.md) for the integration boundary, requirements,
+runtime behavior, and currently documented workflow examples. The
+`nunchaku_torch` runtime is included in this repository and does not require a
+separate checkout.
+
+---
+
+## Upstream documentation
+
+> The following is the original README from
+> [nunchaku-ai/ComfyUI-nunchaku](https://github.com/nunchaku-ai/ComfyUI-nunchaku)
+> at revision
+> [`c71cc259355658e87bc418095c3ef1a65b8f115b`](https://github.com/nunchaku-ai/ComfyUI-nunchaku/commit/c71cc259355658e87bc418095c3ef1a65b8f115b),
+> retained unchanged for reference.
+
 <div align="center" id="nunchaku_logo">
   <img src="https://huggingface.co/datasets/nunchaku-ai/cdn/resolve/main/logo/v2/nunchaku-compact-transparent.png" alt="logo" width="220"></img>
 </div>
@@ -13,13 +59,6 @@
 </div>
 
 This repository provides the ComfyUI plugin for [**Nunchaku**](https://github.com/nunchaku-ai/nunchaku), an efficient inference engine for 4-bit neural networks quantized with [SVDQuant](http://arxiv.org/abs/2411.05007). For the quantization library, check out [DeepCompressor](https://github.com/nunchaku-ai/deepcompressor).
-
-This XPU-focused distribution retains the upstream ComfyUI-nunchaku source
-and adds Intel XPU execution through Comfy Kitchen and `omni_xpu_kernel`. We
-thank the Nunchaku and ComfyUI upstream projects for the model integration and
-node framework this work builds on. See [Intel XPU Support](docs/XPU.md) for
-the integration boundary and requirements. The `nunchaku_torch` runtime is
-bundled in this repository; users do not need a separate runtime checkout.
 
 Join our user groups on [**Discord**](https://discord.gg/Wk6PnwX9Sm) and [**WeChat**](https://huggingface.co/datasets/nunchaku-ai/cdn/resolve/main/nunchaku/assets/wechat.jpg) for discussions—details [here](https://github.com/nunchaku-ai/nunchaku/issues/149). If you have any questions, run into issues, or are interested in contributing, feel free to share your thoughts with us!
 
