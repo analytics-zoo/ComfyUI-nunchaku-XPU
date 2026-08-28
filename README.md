@@ -5,7 +5,7 @@
 >
 > The XPU changes in this fork are developed and performance-tuned for work
 > related to [Intel llm-scaler](https://github.com/intel/llm-scaler), primarily
-> on Ubuntu 24.04 LTS with Intel Arc Pro B70 (BMG-G31, device ID `0xE223`).
+> on Ubuntu 24.04 LTS with Intel Arc Pro B70.
 >
 > Other operating systems, GPU models, software environments, workloads, and
 > configurations are outside the validated scope. Their compatibility,
