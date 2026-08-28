@@ -19,8 +19,9 @@
 > be updated only after any additional support has been implemented and
 > validated.
 >
-> This is a personal downstream fork, not an upstream release or an official
-> commitment to support the upstream project on Intel XPU.
+> This work is experimental. Ongoing support, maintenance, compatibility
+> updates, and future development depend on available time, capacity, and
+> project priorities.
 
 ## Intel XPU integration
 
